@@ -1,0 +1,33 @@
+{
+    "说明": "JiamiaoDB 配置文件",
+    "警告": "不要上传到 GitHub！",
+
+    "server": {
+        "host": "127.0.0.1",
+        "port": 9615,
+        "max_connections": 128,
+        "worker_threads": 4
+    },
+
+    "storage": {
+        "data_dir": "./data",
+        "wal_dir": "./data/wal",
+        "buffer_size_mb": 64,
+        "checkpoint_interval": 5000
+    },
+
+    "ai": {
+        "provider": "minimax",
+        "api_key": "",
+        "api_base": "https://api.minimaxi.com/v1",
+        "model": "MiniMax-M2.7"
+    },
+
+    "node": {
+        "id": "node-1",
+        "role": "standalone",
+        "peers": []
+    },
+
+    "verbose": false
+}
