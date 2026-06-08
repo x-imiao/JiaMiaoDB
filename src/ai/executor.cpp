@@ -2,6 +2,7 @@
 #include "planner.h"
 #include "memory.h"
 #include "../storage/engine.h"
+#include <bits/std_function.h>
 #include <iostream>
 #include <algorithm>
 #include <cmath>

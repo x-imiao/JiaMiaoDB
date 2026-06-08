@@ -1,6 +1,7 @@
 #ifndef JIAMIAODB_STORAGE_ENGINE_H
 #define JIAMIAODB_STORAGE_ENGINE_H
 
+#include <bits/std_function.h>
 #include <string>
 #include <vector>
 #include <map>
