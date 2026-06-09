@@ -44,6 +44,14 @@ UPDATE: {\"type\": \"update\", \"table\": \"t\", \"sets\": [{\"column\": \"col\"
 DELETE: {\"type\": \"delete\", \"table\": \"t\", \"where\": ...}
 CREATE TABLE: {\"type\": \"create_table\", \"name\": \"t\", \"columns\": [{\"name\": \"col\", \"type\": \"TEXT\", \"nullable\": false}]}
 DROP TABLE: {\"type\": \"drop_table\", \"name\": \"t\"}
+CREATE DATABASE: {\"type\": \"create_database\", \"name\": \"db\"}
+DROP DATABASE: {\"type\": \"drop_database\", \"name\": \"db\"}
+CREATE SCHEMA: {\"type\": \"create_schema\", \"name\": \"schema_name\"}
+CREATE USER: {\"type\": \"create_user\", \"name\": \"user_name\", \"password\": \"secret\"}
+DROP USER: {\"type\": \"drop_user\", \"name\": \"user_name\"}
+USE: {\"type\": \"use\", \"name\": \"db\"}
+SHOW DATABASES: {\"type\": \"show_databases\"}
+SHOW USERS: {\"type\": \"show_users\"}
 
 表达式格式：{\"type\": \"binary_op\"|\"column_ref\"|\"literal\", \"op\": \"=\"|\"!=\"|\"<\"|\">\"|\"AND\"|\"OR\", \"left\": ..., \"right\": ...}
 
@@ -232,6 +240,37 @@ NLParseResult NLParser::parse_response(const std::string& response, const std::s
                 stmt->name = op.value("name", std::string(""));
                 result.intent.statement.type = StatementType::DROP_TABLE;
                 result.intent.statement.drop_table = std::move(stmt);
+            } else if (op_type == "create_database") {
+                auto stmt = std::make_unique<CreateDatabaseStmt>();
+                stmt->name = op.value("name", std::string(""));
+                result.intent.statement.type = StatementType::CREATE_DATABASE;
+                result.intent.statement.create_database = std::move(stmt);
+            } else if (op_type == "drop_database") {
+                auto stmt = std::make_unique<DropDatabaseStmt>();
+                stmt->name = op.value("name", std::string(""));
+                result.intent.statement.type = StatementType::DROP_DATABASE;
+                result.intent.statement.drop_database = std::move(stmt);
+            } else if (op_type == "create_schema") {
+                auto stmt = std::make_unique<CreateSchemaStmt>();
+                stmt->name = op.value("name", std::string(""));
+                result.intent.statement.type = StatementType::CREATE_SCHEMA;
+                result.intent.statement.create_schema = std::move(stmt);
+            } else if (op_type == "create_user") {
+                auto stmt = std::make_unique<CreateUserStmt>();
+                stmt->name = op.value("name", std::string(""));
+                stmt->password = op.value("password", std::string(""));
+                result.intent.statement.type = StatementType::CREATE_USER;
+                result.intent.statement.create_user = std::move(stmt);
+            } else if (op_type == "drop_user") {
+                auto stmt = std::make_unique<DropUserStmt>();
+                stmt->name = op.value("name", std::string(""));
+                result.intent.statement.type = StatementType::DROP_USER;
+                result.intent.statement.drop_user = std::move(stmt);
+            } else if (op_type == "use") {
+                auto stmt = std::make_unique<UseDatabaseStmt>();
+                stmt->name = op.value("name", std::string(""));
+                result.intent.statement.type = StatementType::USE_DATABASE;
+                result.intent.statement.use_database = std::move(stmt);
             }
         }
 

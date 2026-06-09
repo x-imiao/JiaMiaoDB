@@ -7,15 +7,31 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --std=c++17 -Wall -Wextra -O2 -pthread")
 # Dependencies
 find_package(CURL REQUIRED)
 
-# Source files
-file(GLOB_RECURSE SOURCES src/*.cpp)
+# Source files (all .cpp under src/, excluding main.cpp)
+file(GLOB_RECURSE ALL_SOURCES src/*.cpp)
+list(REMOVE_ITEM ALL_SOURCES "${CMAKE_SOURCE_DIR}/src/main.cpp")
 
-add_executable(jiamiaodb ${SOURCES})
-target_include_directories(jiamiaodb PRIVATE
+# Static library — shared by main executable and tests
+add_library(jiamiaodb_lib STATIC ${ALL_SOURCES})
+target_include_directories(jiamiaodb_lib PUBLIC
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/src/vendor
 )
-target_link_libraries(jiamiaodb PRIVATE CURL::libcurl)
+target_link_libraries(jiamiaodb_lib PUBLIC CURL::libcurl)
+
+# Main executable
+add_executable(jiamiaodb src/main.cpp)
+target_link_libraries(jiamiaodb PRIVATE jiamiaodb_lib)
 
 # Install
 install(TARGETS jiamiaodb DESTINATION bin)
+
+# ── Tests ───────────────────────────────────────────────────
+option(BUILD_TESTS "Build unit tests" ON)
+if(BUILD_TESTS)
+    enable_testing()
+    file(GLOB TEST_SOURCES tests/*.cpp)
+    add_executable(jiamiaodb_test ${TEST_SOURCES})
+    target_link_libraries(jiamiaodb_test PRIVATE jiamiaodb_lib)
+    add_test(NAME jiamiaodb_test COMMAND jiamiaodb_test)
+endif()

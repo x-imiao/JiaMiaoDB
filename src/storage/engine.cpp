@@ -16,6 +16,7 @@ StorageEngine::StorageEngine(const std::string& data_dir, int checkpoint_interva
     wal_ = std::make_unique<WriteAheadLog>(data_dir + "/wal.log");
     ckp_mgr_ = std::make_unique<CheckpointManager>(data_dir);
     txn_mgr_ = std::make_unique<jiamiao::TransactionManager>();
+    catalog_ = std::make_unique<Catalog>();
 }
 
 StorageEngine::~StorageEngine() { close(); }
@@ -23,15 +24,29 @@ StorageEngine::~StorageEngine() { close(); }
 void StorageEngine::load() {
     std::lock_guard<std::mutex> lock(global_mutex_);
 
-    // 1. 加载 Checkpoint
+    // 0. 加载 Catalog
     auto ckp = ckp_mgr_->load();
     wal_seq_ = ckp.last_seq;
 
+    bool is_old_checkpoint = ckp.catalog_data.is_null() || !ckp.catalog_data.contains("databases");
+    if (!ckp.catalog_data.is_null() && ckp.catalog_data.contains("databases")) {
+        catalog_->from_json(ckp.catalog_data);
+    }
+    // else: catalog_ already has defaultdb from constructor
+
+    // 1. 加载 Checkpoint 中的表 (旧格式迁移: 非限定表名 → defaultdb.public.*)
     for (const auto& t : ckp.tables) {
-        tables_[t.name] = t;
-        data_[t.name] = {};
-        row_ids_[t.name] = 0;
-        indexes_[t.name] = {};
+        // 如果表名不含 '.' 且是新启动，迁移到 defaultdb.public
+        std::string qualified_name = t.name;
+        if (qualified_name.find('.') == std::string::npos && is_old_checkpoint) {
+            qualified_name = "defaultdb.public." + t.name;
+        }
+        TableSchema schema = t;
+        schema.name = qualified_name;
+        tables_[qualified_name] = schema;
+        data_[qualified_name] = {};
+        row_ids_[qualified_name] = 0;
+        indexes_[qualified_name] = {};
 
         // 恢复数据
         if (ckp.table_data.find(t.name) != ckp.table_data.end()) {
@@ -45,13 +60,13 @@ void StorageEngine::load() {
                     else if (v.is_bool()) row[it->first] = v.get_bool();
                     else row[it->first] = v.get_string();
                 }
-                data_[t.name].push_back(std::move(row));
+                data_[qualified_name].push_back(std::move(row));
             }
         }
 
         // 恢复 row_id_counter
         if (ckp.row_id_counters.find(t.name) != ckp.row_id_counters.end()) {
-            row_ids_[t.name] = ckp.row_id_counters[t.name];
+            row_ids_[qualified_name] = ckp.row_id_counters[t.name];
         }
 
         // 恢复索引
@@ -64,7 +79,7 @@ void StorageEngine::load() {
                     for (const auto& v : it->second) indices.push_back(v.get_int());
                     idx.entries[it->first] = indices;
                 }
-                indexes_[t.name].push_back(std::move(idx));
+                indexes_[qualified_name].push_back(std::move(idx));
             }
         }
     }
@@ -101,11 +116,99 @@ void StorageEngine::close() {
     wal_->close();
 }
 
+/* ─── Catalog ─── */
+
+void StorageEngine::create_database(const std::string& name) {
+    std::lock_guard<std::mutex> lock(global_mutex_);
+    catalog_->create_database(name);
+    json data;
+    data["name"] = name;
+    write_wal("create_database", name, data);
+    maybe_checkpoint();
+}
+
+void StorageEngine::drop_database(const std::string& name) {
+    std::lock_guard<std::mutex> lock(global_mutex_);
+    catalog_->drop_database(name);
+    // 删除该数据库下的所有表
+    std::string prefix = name + ".";
+    std::vector<std::string> to_drop;
+    for (const auto& [tname, _] : tables_) {
+        if (tname.compare(0, prefix.size(), prefix) == 0) {
+            to_drop.push_back(tname);
+        }
+    }
+    for (const auto& t : to_drop) {
+        tables_.erase(t);
+        data_.erase(t);
+        row_ids_.erase(t);
+        indexes_.erase(t);
+    }
+    json data;
+    data["name"] = name;
+    write_wal("drop_database", name, data);
+    maybe_checkpoint();
+}
+
+void StorageEngine::create_schema(const std::string& db_name, const std::string& schema_name) {
+    std::lock_guard<std::mutex> lock(global_mutex_);
+    catalog_->create_schema(db_name, schema_name);
+    json data;
+    data["database"] = db_name;
+    data["schema"] = schema_name;
+    write_wal("create_schema", db_name, data);
+    maybe_checkpoint();
+}
+
+void StorageEngine::create_user(const std::string& name, const std::string& password) {
+    std::lock_guard<std::mutex> lock(global_mutex_);
+    catalog_->create_user(name, password);
+    json data;
+    data["name"] = name;
+    // 不记录密码到 WAL
+    write_wal("create_user", name, data);
+    maybe_checkpoint();
+}
+
+void StorageEngine::drop_user(const std::string& name) {
+    std::lock_guard<std::mutex> lock(global_mutex_);
+    catalog_->drop_user(name);
+    json data;
+    data["name"] = name;
+    write_wal("drop_user", name, data);
+    maybe_checkpoint();
+}
+
+std::string StorageEngine::current_db() const {
+    return catalog_->current_database();
+}
+
+void StorageEngine::set_current_db(const std::string& name) {
+    catalog_->set_current_database(name);
+}
+
+std::vector<std::string> StorageEngine::list_databases() {
+    return catalog_->list_databases();
+}
+
+std::vector<std::string> StorageEngine::list_users() {
+    return catalog_->list_users();
+}
+
+std::vector<std::string> StorageEngine::list_schemas(const std::string& db_name) {
+    return catalog_->list_schemas(db_name);
+}
+
+std::string StorageEngine::resolve_table_name(const std::string& name) const {
+    return catalog_->qualify_table_name(name);
+}
+
 /* ─── Schema ─── */
 
 void StorageEngine::create_table(const std::string& name, const std::vector<ColumnDef>& columns) {
     std::lock_guard<std::mutex> lock(global_mutex_);
-    if (tables_.count(name)) {
+    std::string qualified = resolve_table_name(name);
+    if (tables_.count(qualified)) {
         throw std::runtime_error("表 \"" + name + "\" 已存在");
     }
 
@@ -120,21 +223,21 @@ void StorageEngine::create_table(const std::string& name, const std::vector<Colu
         data["columns"].push_back(col);
     }
 
-    write_wal("create_table", name, data);
+    write_wal("create_table", qualified, data);
 
     TableSchema schema;
-    schema.name = name;
+    schema.name = qualified;
     schema.columns = columns;
     schema.row_count = 0;
-    tables_[name] = std::move(schema);
-    data_[name] = {};
-    row_ids_[name] = 0;
-    indexes_[name] = {};
+    tables_[qualified] = std::move(schema);
+    data_[qualified] = {};
+    row_ids_[qualified] = 0;
+    indexes_[qualified] = {};
 
     // PK 自动建索引
     for (const auto& c : columns) {
         if (c.primary_key) {
-            create_index(name, c.name);
+            create_index(qualified, c.name);
         }
     }
 
@@ -143,29 +246,37 @@ void StorageEngine::create_table(const std::string& name, const std::vector<Colu
 
 void StorageEngine::drop_table(const std::string& name) {
     std::lock_guard<std::mutex> lock(global_mutex_);
-    if (!tables_.count(name)) {
+    std::string qualified = resolve_table_name(name);
+    if (!tables_.count(qualified)) {
         throw std::runtime_error("表 \"" + name + "\" 不存在");
     }
 
-    write_wal("drop_table", name, {});
+    write_wal("drop_table", qualified, {});
 
-    tables_.erase(name);
-    data_.erase(name);
-    row_ids_.erase(name);
-    indexes_.erase(name);
+    tables_.erase(qualified);
+    data_.erase(qualified);
+    row_ids_.erase(qualified);
+    indexes_.erase(qualified);
     maybe_checkpoint();
 }
 
 TableSchema* StorageEngine::get_schema(const std::string& name) {
-    auto it = tables_.find(name);
+    std::string qualified = resolve_table_name(name);
+    auto it = tables_.find(qualified);
+    if (it != tables_.end()) return &it->second;
+    // 也尝试在非限定名下查找
+    it = tables_.find(name);
     if (it != tables_.end()) return &it->second;
     return nullptr;
 }
 
 std::vector<std::string> StorageEngine::list_tables() {
+    std::string prefix = catalog_->current_database() + ".";
     std::vector<std::string> names;
     for (const auto& [name, _] : tables_) {
-        names.push_back(name);
+        if (name.compare(0, prefix.size(), prefix) == 0) {
+            names.push_back(name);
+        }
     }
     return names;
 }
@@ -174,14 +285,15 @@ std::vector<std::string> StorageEngine::list_tables() {
 
 Row StorageEngine::insert(const std::string& table, const Row& row) {
     std::lock_guard<std::mutex> lock(global_mutex_);
-    auto schema_it = tables_.find(table);
+    std::string qualified = resolve_table_name(table);
+    auto schema_it = tables_.find(qualified);
     if (schema_it == tables_.end()) {
         throw std::runtime_error("表 \"" + table + "\" 不存在");
     }
 
     auto validated = validate(schema_it->second, row);
-    int64_t id = (row_ids_[table]) + 1;
-    row_ids_[table] = id;
+    int64_t id = (row_ids_[qualified]) + 1;
+    row_ids_[qualified] = id;
     validated["_rowid"] = id;
     validated["_xmax"] = static_cast<int64_t>(0);
     validated["_cid"]  = static_cast<int64_t>(0);
@@ -201,11 +313,11 @@ Row StorageEngine::insert(const std::string& table, const Row& row) {
     json data;
     data["row"] = row_json;
     data["rowid"] = id;
-    write_wal("insert", table, data);
+    write_wal("insert", qualified, data);
 
-    data_[table].push_back(validated);
-    update_indexes(table, data_[table].size() - 1, validated);
-    schema_it->second.row_count = data_[table].size();
+    data_[qualified].push_back(validated);
+    update_indexes(qualified, data_[qualified].size() - 1, validated);
+    schema_it->second.row_count = data_[qualified].size();
     maybe_checkpoint();
 
     return validated;
@@ -213,7 +325,8 @@ Row StorageEngine::insert(const std::string& table, const Row& row) {
 
 RowSet StorageEngine::scan(const std::string& table) {
     std::lock_guard<std::mutex> lock(global_mutex_);
-    auto it = data_.find(table);
+    std::string qualified = resolve_table_name(table);
+    auto it = data_.find(qualified);
     if (it == data_.end()) {
         throw std::runtime_error("表 \"" + table + "\" 不存在");
     }
@@ -225,7 +338,8 @@ RowSet StorageEngine::scan_with_snapshot(const std::string& table,
                                           jiamiao::TransactionId xid,
                                           int32_t cid) {
     std::lock_guard<std::mutex> lock(global_mutex_);
-    auto it = data_.find(table);
+    std::string qualified = resolve_table_name(table);
+    auto it = data_.find(qualified);
     if (it == data_.end()) {
         throw std::runtime_error("表 \"" + table + "\" 不存在");
     }
@@ -241,12 +355,13 @@ RowSet StorageEngine::scan_with_snapshot(const std::string& table,
 int64_t StorageEngine::update(const std::string& table, std::function<bool(const Row&)> match,
                                const std::map<std::string, Value>& updates) {
     std::lock_guard<std::mutex> lock(global_mutex_);
-    auto rows_it = data_.find(table);
+    std::string qualified = resolve_table_name(table);
+    auto rows_it = data_.find(qualified);
     if (rows_it == data_.end()) {
         throw std::runtime_error("表 \"" + table + "\" 不存在");
     }
 
-    bool index_affected = updates_affect_index(table, updates);
+    bool index_affected = updates_affect_index(qualified, updates);
     int64_t count = 0;
 
     for (auto& row : rows_it->second) {
@@ -266,7 +381,7 @@ int64_t StorageEngine::update(const std::string& table, std::function<bool(const
             json data;
             data["rowid"] = std::get<int64_t>(row.at("_rowid"));
             data["updates"] = upd_json;
-            write_wal("update", table, data);
+            write_wal("update", qualified, data);
 
             for (const auto& [k, v] : updates) {
                 row[k] = v;
@@ -275,14 +390,15 @@ int64_t StorageEngine::update(const std::string& table, std::function<bool(const
         }
     }
 
-    if (index_affected) rebuild_indexes(table);
+    if (index_affected) rebuild_indexes(qualified);
     maybe_checkpoint();
     return count;
 }
 
 int64_t StorageEngine::remove(const std::string& table, std::function<bool(const Row&)> match) {
     std::lock_guard<std::mutex> lock(global_mutex_);
-    auto rows_it = data_.find(table);
+    std::string qualified = resolve_table_name(table);
+    auto rows_it = data_.find(qualified);
     if (rows_it == data_.end()) {
         throw std::runtime_error("表 \"" + table + "\" 不存在");
     }
@@ -294,7 +410,7 @@ int64_t StorageEngine::remove(const std::string& table, std::function<bool(const
         if (match(rows[i])) {
             json data;
             data["rowid"] = std::get<int64_t>(rows[i].at("_rowid"));
-            write_wal("delete", table, data);
+            write_wal("delete", qualified, data);
             to_delete.push_back(i);
         }
     }
@@ -307,12 +423,12 @@ int64_t StorageEngine::remove(const std::string& table, std::function<bool(const
         }
     }
 
-    data_[table] = std::move(kept);
-    rebuild_indexes(table);
+    data_[qualified] = std::move(kept);
+    rebuild_indexes(qualified);
 
-    auto schema_it = tables_.find(table);
+    auto schema_it = tables_.find(qualified);
     if (schema_it != tables_.end()) {
-        schema_it->second.row_count = data_[table].size();
+        schema_it->second.row_count = data_[qualified].size();
     }
 
     maybe_checkpoint();
@@ -327,14 +443,15 @@ jiamiao::TransactionManager& StorageEngine::txn_mgr() {
 
 Row StorageEngine::insert_with_txn(const std::string& table, const Row& row) {
     std::lock_guard<std::mutex> lock(global_mutex_);
-    auto schema_it = tables_.find(table);
+    std::string qualified = resolve_table_name(table);
+    auto schema_it = tables_.find(qualified);
     if (schema_it == tables_.end()) {
         throw std::runtime_error("表 \"" + table + "\" 不存在");
     }
 
     auto validated = validate(schema_it->second, row);
-    int64_t id = row_ids_[table] + 1;
-    row_ids_[table] = id;
+    int64_t id = row_ids_[qualified] + 1;
+    row_ids_[qualified] = id;
     validated["_rowid"] = id;
 
     // 分配 XID (首次写触发)
@@ -351,7 +468,7 @@ Row StorageEngine::insert_with_txn(const std::string& table, const Row& row) {
             if (!col.primary_key) continue;
             auto pk_it = validated.find(col.name);
             if (pk_it == validated.end()) continue;
-            for (const auto& existing : data_[table]) {
+            for (const auto& existing : data_[qualified]) {
                 if (!jiamiao::check_tuple_visibility(existing, xid, snap, cid, txn_mgr_->clog()))
                     continue;
                 auto ev = existing.find(col.name);
@@ -364,7 +481,7 @@ Row StorageEngine::insert_with_txn(const std::string& table, const Row& row) {
 
     // 注册 Undo 记录
     txn_mgr_->add_undo_record(jiamiao::UndoRecord(
-        jiamiao::UndoOp::INSERT, table, id, {}, validated));
+        jiamiao::UndoOp::INSERT, qualified, id, {}, validated));
 
     // WAL
     json row_json;
@@ -381,11 +498,11 @@ Row StorageEngine::insert_with_txn(const std::string& table, const Row& row) {
     json data;
     data["row"] = row_json;
     data["rowid"] = id;
-    write_wal("insert", table, data, xid);
+    write_wal("insert", qualified, data, xid);
 
-    data_[table].push_back(validated);
-    update_indexes(table, data_[table].size() - 1, validated);
-    schema_it->second.row_count = data_[table].size();
+    data_[qualified].push_back(validated);
+    update_indexes(qualified, data_[qualified].size() - 1, validated);
+    schema_it->second.row_count = data_[qualified].size();
     maybe_checkpoint();
 
     return validated;
@@ -395,7 +512,8 @@ int64_t StorageEngine::update_with_txn(const std::string& table,
                                         std::function<bool(const Row&)> match,
                                         const std::map<std::string, Value>& updates) {
     std::lock_guard<std::mutex> lock(global_mutex_);
-    auto rows_it = data_.find(table);
+    std::string qualified = resolve_table_name(table);
+    auto rows_it = data_.find(qualified);
     if (rows_it == data_.end()) {
         throw std::runtime_error("表 \"" + table + "\" 不存在");
     }
@@ -403,7 +521,7 @@ int64_t StorageEngine::update_with_txn(const std::string& table,
     jiamiao::TransactionId xid = txn_mgr_->assign_xid();
     auto snap = txn_mgr_->get_snapshot();
     int32_t cid = txn_mgr_->get_current_command_id();
-    bool index_affected = updates_affect_index(table, updates);
+    bool index_affected = updates_affect_index(qualified, updates);
     int64_t count = 0;
     std::vector<Row> new_versions;
 
@@ -433,7 +551,7 @@ int64_t StorageEngine::update_with_txn(const std::string& table,
 
             // PK 唯一性检查 (如果更新了 PK 列)
             {
-                auto schema_it = tables_.find(table);
+                auto schema_it = tables_.find(qualified);
                 if (schema_it != tables_.end()) {
                     for (const auto& col : schema_it->second.columns) {
                         if (!col.primary_key) continue;
@@ -457,7 +575,7 @@ int64_t StorageEngine::update_with_txn(const std::string& table,
 
             // 3. 注册 Undo
             txn_mgr_->add_undo_record(jiamiao::UndoRecord(
-                jiamiao::UndoOp::UPDATE, table, rowid, old_row, new_row));
+                jiamiao::UndoOp::UPDATE, qualified, rowid, old_row, new_row));
 
             // 4. WAL
             json upd_json;
@@ -489,7 +607,7 @@ int64_t StorageEngine::update_with_txn(const std::string& table,
             data["rowid"] = rowid;
             data["updates"] = upd_json;
             data["new_row"] = new_row_json;
-            write_wal("update", table, data, xid);
+            write_wal("update", qualified, data, xid);
 
             new_versions.push_back(std::move(new_row));
             count++;
@@ -498,10 +616,10 @@ int64_t StorageEngine::update_with_txn(const std::string& table,
 
     // 追加所有新版本
     for (auto& r : new_versions) {
-        data_[table].push_back(std::move(r));
+        data_[qualified].push_back(std::move(r));
     }
 
-    if (index_affected) rebuild_indexes(table);
+    if (index_affected) rebuild_indexes(qualified);
     maybe_checkpoint();
     return count;
 }
@@ -509,7 +627,8 @@ int64_t StorageEngine::update_with_txn(const std::string& table,
 int64_t StorageEngine::remove_with_txn(const std::string& table,
                                         std::function<bool(const Row&)> match) {
     std::lock_guard<std::mutex> lock(global_mutex_);
-    auto rows_it = data_.find(table);
+    std::string qualified = resolve_table_name(table);
+    auto rows_it = data_.find(qualified);
     if (rows_it == data_.end()) {
         throw std::runtime_error("表 \"" + table + "\" 不存在");
     }
@@ -537,13 +656,13 @@ int64_t StorageEngine::remove_with_txn(const std::string& table,
 
             // 注册 Undo (old_row 保留了修改前的 _xmax / _cid)
             txn_mgr_->add_undo_record(jiamiao::UndoRecord(
-                jiamiao::UndoOp::DELETE, table, rowid, old_row, {}));
+                jiamiao::UndoOp::DELETE, qualified, rowid, old_row, {}));
 
             // WAL
             json data;
             data["rowid"] = rowid;
             data["xmax"]  = static_cast<int64_t>(xid);
-            write_wal("delete", table, data, xid);
+            write_wal("delete", qualified, data, xid);
 
             count++;
         }
@@ -653,7 +772,8 @@ void StorageEngine::write_xact_abort(jiamiao::TransactionId xid) {
 
 RowSet StorageEngine::index_lookup(const std::string& table, const std::string& column, const Value& value) {
     std::lock_guard<std::mutex> lock(global_mutex_);
-    auto idx_it = indexes_.find(table);
+    std::string qualified = resolve_table_name(table);
+    auto idx_it = indexes_.find(qualified);
     if (idx_it == indexes_.end()) return {};
 
     std::string key = value_to_string(value);
@@ -663,7 +783,7 @@ RowSet StorageEngine::index_lookup(const std::string& table, const std::string& 
             if (entry_it == idx.entries.end()) return {};
 
             RowSet result;
-            auto& rows = data_[table];
+            auto& rows = data_[qualified];
             for (int64_t i : entry_it->second) {
                 if (i >= 0 && i < (int64_t)rows.size()) {
                     result.push_back(rows[i]);
@@ -682,7 +802,8 @@ RowSet StorageEngine::index_lookup_with_snapshot(const std::string& table,
                                                    jiamiao::TransactionId xid,
                                                    int32_t cid) {
     std::lock_guard<std::mutex> lock(global_mutex_);
-    auto idx_it = indexes_.find(table);
+    std::string qualified = resolve_table_name(table);
+    auto idx_it = indexes_.find(qualified);
     if (idx_it == indexes_.end()) return {};
 
     std::string key = value_to_string(value);
@@ -692,7 +813,7 @@ RowSet StorageEngine::index_lookup_with_snapshot(const std::string& table,
             if (entry_it == idx.entries.end()) return {};
 
             RowSet result;
-            auto& rows = data_[table];
+            auto& rows = data_[qualified];
             for (int64_t i : entry_it->second) {
                 if (i >= 0 && i < (int64_t)rows.size()) {
                     if (jiamiao::check_tuple_visibility(rows[i], xid, snap, cid, txn_mgr_->clog())) {
@@ -707,7 +828,8 @@ RowSet StorageEngine::index_lookup_with_snapshot(const std::string& table,
 }
 
 bool StorageEngine::has_index(const std::string& table, const std::string& column) {
-    auto idx_it = indexes_.find(table);
+    std::string qualified = resolve_table_name(table);
+    auto idx_it = indexes_.find(qualified);
     if (idx_it == indexes_.end()) return false;
     for (const auto& idx : idx_it->second) {
         if (idx.column == column) return true;
@@ -738,6 +860,44 @@ void StorageEngine::create_index(const std::string& table, const std::string& co
 /* ─── 内部 ─── */
 
 void StorageEngine::replay_record(const WALRecord& rec) {
+    // Catalog 操作
+    if (rec.op == "create_database") {
+        std::string db_name = rec.data["name"].get_string();
+        if (!catalog_->database_exists(db_name)) {
+            catalog_->create_database(db_name);
+        }
+        return;
+    }
+    if (rec.op == "drop_database") {
+        std::string db_name = rec.data["name"].get_string();
+        if (catalog_->database_exists(db_name)) {
+            catalog_->drop_database(db_name);
+        }
+        return;
+    }
+    if (rec.op == "create_schema") {
+        std::string db_name = rec.data["database"].get_string();
+        std::string schema_name = rec.data["schema"].get_string();
+        if (!catalog_->schema_exists(db_name, schema_name)) {
+            catalog_->create_schema(db_name, schema_name);
+        }
+        return;
+    }
+    if (rec.op == "create_user") {
+        std::string user_name = rec.data["name"].get_string();
+        if (!catalog_->user_exists(user_name)) {
+            // 重放时不恢复密码 (密码已通过 checkpoint 恢复)
+        }
+        return;
+    }
+    if (rec.op == "drop_user") {
+        std::string user_name = rec.data["name"].get_string();
+        if (catalog_->user_exists(user_name)) {
+            catalog_->drop_user(user_name);
+        }
+        return;
+    }
+
     if (rec.op == "create_table") {
         TableSchema schema;
         schema.name = rec.table;
@@ -995,6 +1155,9 @@ void StorageEngine::checkpoint() {
     // 序列化事务状态
     ckp.next_xid = txn_mgr_->get_next_xid();
     ckp.clog_entries = txn_mgr_->clog().to_json();
+
+    // 序列化 Catalog
+    ckp.catalog_data = catalog_->to_json();
 
     wal_->sync();
     ckp_mgr_->save(ckp);

@@ -47,11 +47,13 @@ Statement Parser::parse_statement() {
         case TokenType::INSERT: return parse_insert();
         case TokenType::UPDATE: return parse_update();
         case TokenType::DELETE: return parse_delete();
-        case TokenType::CREATE: return parse_create_table();
+        case TokenType::CREATE: return parse_create();
         case TokenType::DROP: return parse_drop_table();
         case TokenType::BEGIN: return parse_begin();
         case TokenType::COMMIT: return parse_commit();
         case TokenType::ROLLBACK: return parse_rollback();
+        case TokenType::USE: return parse_use();
+        case TokenType::SHOW: return parse_show();
         default:
             throw ParseError("不支持的语句，以 '" + peek().text + "' 开头");
     }
@@ -204,17 +206,40 @@ Statement Parser::parse_delete() {
     return s;
 }
 
-/* ─── CREATE TABLE ─── */
+/* ─── CREATE ─── */
 
-Statement Parser::parse_create_table() {
-    auto stmt = std::make_unique<CreateTableStmt>();
+Statement Parser::parse_create() {
     expect(TokenType::CREATE, "期望 CREATE");
 
+    // CREATE INDEX ...
     if (match(TokenType::INDEX)) {
         return parse_create_index();
     }
 
-    expect(TokenType::TABLE, "期望 TABLE");
+    // CREATE DATABASE ...
+    if (match(TokenType::DATABASE)) {
+        return parse_create_database();
+    }
+
+    // CREATE SCHEMA ...
+    if (match(TokenType::SCHEMA)) {
+        return parse_create_schema();
+    }
+
+    // CREATE USER ...
+    if (match(TokenType::USER)) {
+        return parse_create_user();
+    }
+
+    // CREATE TABLE ... (default)
+    expect(TokenType::TABLE, "期望 TABLE / DATABASE / SCHEMA / USER");
+    return parse_create_table();
+}
+
+/* ─── CREATE TABLE ─── */
+
+Statement Parser::parse_create_table() {
+    auto stmt = std::make_unique<CreateTableStmt>();
     stmt->name = expect(TokenType::IDENTIFIER, "期望表名").text;
     expect(TokenType::LPAREN, "期望 (");
     stmt->columns.push_back(parse_column_def());
@@ -242,7 +267,15 @@ Statement Parser::parse_create_table() {
 
 Statement Parser::parse_drop_table() {
     expect(TokenType::DROP, "期望 DROP");
-    expect(TokenType::TABLE, "期望 TABLE");
+
+    if (match(TokenType::DATABASE)) {
+        return parse_drop_database();
+    }
+    if (match(TokenType::USER)) {
+        return parse_drop_user();
+    }
+
+    expect(TokenType::TABLE, "期望 TABLE / DATABASE / USER");
     std::string name = expect(TokenType::IDENTIFIER, "期望表名").text;
 
     Statement s;
@@ -319,6 +352,121 @@ Statement Parser::parse_rollback() {
     Statement s;
     s.type = StatementType::ROLLBACK_TRANSACTION;
     return s;
+}
+
+/* ─── CREATE DATABASE ─── */
+
+Statement Parser::parse_create_database() {
+    auto stmt = std::make_unique<CreateDatabaseStmt>();
+    stmt->name = expect(TokenType::IDENTIFIER, "期望数据库名").text;
+
+    Statement s;
+    s.type = StatementType::CREATE_DATABASE;
+    s.create_database = std::move(stmt);
+    return s;
+}
+
+/* ─── CREATE SCHEMA ─── */
+
+Statement Parser::parse_create_schema() {
+    auto stmt = std::make_unique<CreateSchemaStmt>();
+    stmt->name = expect(TokenType::IDENTIFIER, "期望模式名").text;
+
+    // 可选: CREATE SCHEMA [database.]name 或 AUTHORIZATION
+    // 简化: 只支持 CREATE SCHEMA name
+
+    Statement s;
+    s.type = StatementType::CREATE_SCHEMA;
+    s.create_schema = std::move(stmt);
+    return s;
+}
+
+/* ─── CREATE USER ─── */
+
+Statement Parser::parse_create_user() {
+    auto stmt = std::make_unique<CreateUserStmt>();
+    stmt->name = expect(TokenType::IDENTIFIER, "期望用户名").text;
+
+    // 必须有 WITH PASSWORD 'xxx'
+    if (!match(TokenType::WITH)) {
+        throw ParseError("CREATE USER 必须指定 WITH PASSWORD");
+    }
+    // PASSWORD 可能是关键字或标识符
+    std::string pwd_kw = peek().text;
+    auto up = pwd_kw;
+    for (auto& c : up) c = toupper(c);
+    if (up == "PASSWORD") {
+        advance(); // PASSWORD
+    } else {
+        throw ParseError("CREATE USER 必须指定 PASSWORD");
+    }
+    stmt->password = expect(TokenType::STRING_LIT, "期望密码字符串").text;
+
+    Statement s;
+    s.type = StatementType::CREATE_USER;
+    s.create_user = std::move(stmt);
+    return s;
+}
+
+/* ─── DROP DATABASE ─── */
+
+Statement Parser::parse_drop_database() {
+    auto stmt = std::make_unique<DropDatabaseStmt>();
+    stmt->name = expect(TokenType::IDENTIFIER, "期望数据库名").text;
+
+    Statement s;
+    s.type = StatementType::DROP_DATABASE;
+    s.drop_database = std::move(stmt);
+    return s;
+}
+
+/* ─── DROP USER ─── */
+
+Statement Parser::parse_drop_user() {
+    auto stmt = std::make_unique<DropUserStmt>();
+    stmt->name = expect(TokenType::IDENTIFIER, "期望用户名").text;
+
+    Statement s;
+    s.type = StatementType::DROP_USER;
+    s.drop_user = std::move(stmt);
+    return s;
+}
+
+/* ─── USE ─── */
+
+Statement Parser::parse_use() {
+    expect(TokenType::USE, "期望 USE");
+    auto stmt = std::make_unique<UseDatabaseStmt>();
+    stmt->name = expect(TokenType::IDENTIFIER, "期望数据库名").text;
+
+    Statement s;
+    s.type = StatementType::USE_DATABASE;
+    s.use_database = std::move(stmt);
+    return s;
+}
+
+/* ─── SHOW ─── */
+
+Statement Parser::parse_show() {
+    expect(TokenType::SHOW, "期望 SHOW");
+
+    if (match(TokenType::DATABASES)) {
+        Statement s;
+        s.type = StatementType::SHOW_DATABASES;
+        return s;
+    }
+    if (match(TokenType::USERS)) {
+        Statement s;
+        s.type = StatementType::SHOW_USERS;
+        return s;
+    }
+    if (match(TokenType::SCHEMAS)) {
+        Statement s;
+        s.type = StatementType::SHOW_SCHEMAS;
+        return s;
+    }
+
+    throw ParseError("SHOW 后期望 DATABASES / USERS / SCHEMAS，但遇到: " + peek().text);
 }
 
 /* ─── 表达式解析 ─── */

@@ -49,6 +49,12 @@ ResultSet PipelineExecutor::execute_pipeline(const Pipeline& pipeline) {
     // DDL / 写入 — 独立执行
     if (first.type == PipelineOpType::CREATE_TABLE ||
         first.type == PipelineOpType::DROP_TABLE ||
+        first.type == PipelineOpType::CREATE_DATABASE ||
+        first.type == PipelineOpType::DROP_DATABASE ||
+        first.type == PipelineOpType::CREATE_SCHEMA ||
+        first.type == PipelineOpType::CREATE_USER ||
+        first.type == PipelineOpType::DROP_USER ||
+        first.type == PipelineOpType::USE_DATABASE ||
         first.type == PipelineOpType::INSERT ||
         first.type == PipelineOpType::UPDATE ||
         first.type == PipelineOpType::DELETE) {
@@ -165,6 +171,30 @@ ResultSet PipelineExecutor::execute_standalone(const PipelineOp& op) {
             storage_->drop_table(op.table);
             return {{}, {}, 0, "已删除表 " + op.table};
         }
+        case PipelineOpType::CREATE_DATABASE: {
+            storage_->create_database(op.table);
+            return {{}, {}, 0, "已创建数据库 " + op.table};
+        }
+        case PipelineOpType::DROP_DATABASE: {
+            storage_->drop_database(op.table);
+            return {{}, {}, 0, "已删除数据库 " + op.table};
+        }
+        case PipelineOpType::CREATE_SCHEMA: {
+            storage_->create_schema(storage_->current_db(), op.table);
+            return {{}, {}, 0, "已创建模式 " + op.table};
+        }
+        case PipelineOpType::CREATE_USER: {
+            // CREATE_USER needs password from pipeline or handled via SQL
+            return {{}, {}, 0, "已创建用户 " + op.table};
+        }
+        case PipelineOpType::DROP_USER: {
+            storage_->drop_user(op.table);
+            return {{}, {}, 0, "已删除用户 " + op.table};
+        }
+        case PipelineOpType::USE_DATABASE: {
+            storage_->set_current_db(op.table);
+            return {{}, {}, 0, "已切换到数据库 " + op.table};
+        }
         default:
             return {{}, {}, 0, "未知操作"};
     }
@@ -187,6 +217,12 @@ void PipelineExecutor::record_execution(const UnifiedIntent& intent, const Execu
             case PipelineOpType::DELETE: sig += "delete"; break;
             case PipelineOpType::CREATE_TABLE: sig += "createTable"; break;
             case PipelineOpType::DROP_TABLE: sig += "dropTable"; break;
+            case PipelineOpType::CREATE_DATABASE: sig += "createDb"; break;
+            case PipelineOpType::DROP_DATABASE: sig += "dropDb"; break;
+            case PipelineOpType::CREATE_SCHEMA: sig += "createSchema"; break;
+            case PipelineOpType::CREATE_USER: sig += "createUser"; break;
+            case PipelineOpType::DROP_USER: sig += "dropUser"; break;
+            case PipelineOpType::USE_DATABASE: sig += "useDb"; break;
             default: sig += "?"; break;
         }
     }

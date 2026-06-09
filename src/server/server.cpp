@@ -1,5 +1,6 @@
 #include "server.h"
 #include "../storage/engine.h"
+#include "../storage/catalog.h"
 #include "../ai/memory.h"
 #include "../ai/executor.h"
 #include "../ai/nl_parser.h"
@@ -163,7 +164,40 @@ void JiamiaoDBServer::handle_client(int client_fd) {
         auto tables = storage_->list_tables();
         json j;
         j["type"] = "table_list";
+        j["database"] = storage_->current_db();
         { json arr = json::array(); for (const auto& t : tables) arr.push_back(t); j["tables"] = arr; }
+        std::string resp = j.dump() + "\n";
+        write(client_fd, resp.c_str(), resp.size());
+        return;
+    }
+
+    if (input == ".databases") {
+        auto dbs = storage_->list_databases();
+        json j;
+        j["type"] = "database_list";
+        j["current"] = storage_->current_db();
+        { json arr = json::array(); for (const auto& d : dbs) arr.push_back(d); j["databases"] = arr; }
+        std::string resp = j.dump() + "\n";
+        write(client_fd, resp.c_str(), resp.size());
+        return;
+    }
+
+    if (input == ".users") {
+        auto users = storage_->list_users();
+        json j;
+        j["type"] = "user_list";
+        { json arr = json::array(); for (const auto& u : users) arr.push_back(u); j["users"] = arr; }
+        std::string resp = j.dump() + "\n";
+        write(client_fd, resp.c_str(), resp.size());
+        return;
+    }
+
+    if (input == ".schemas") {
+        auto schemas = storage_->list_schemas(storage_->current_db());
+        json j;
+        j["type"] = "schema_list";
+        j["database"] = storage_->current_db();
+        { json arr = json::array(); for (const auto& s : schemas) arr.push_back(s); j["schemas"] = arr; }
         std::string resp = j.dump() + "\n";
         write(client_fd, resp.c_str(), resp.size());
         return;
@@ -231,6 +265,52 @@ std::string JiamiaoDBServer::process_query(const std::string& input) {
                                 intent.tables = {intent.statement.drop_table->name};
                             intent.is_write = true;
                             break;
+                        case StatementType::CREATE_DATABASE:
+                            intent.category = IntentCategory::SCHEMA;
+                            if (intent.statement.create_database)
+                                intent.tables = {intent.statement.create_database->name};
+                            intent.is_write = true;
+                            break;
+                        case StatementType::DROP_DATABASE:
+                            intent.category = IntentCategory::SCHEMA;
+                            if (intent.statement.drop_database)
+                                intent.tables = {intent.statement.drop_database->name};
+                            intent.is_write = true;
+                            break;
+                        case StatementType::CREATE_SCHEMA:
+                            intent.category = IntentCategory::SCHEMA;
+                            if (intent.statement.create_schema)
+                                intent.tables = {intent.statement.create_schema->name};
+                            intent.is_write = true;
+                            break;
+                        case StatementType::CREATE_USER:
+                            intent.category = IntentCategory::SCHEMA;
+                            if (intent.statement.create_user)
+                                intent.tables = {intent.statement.create_user->name};
+                            intent.is_write = true;
+                            break;
+                        case StatementType::DROP_USER:
+                            intent.category = IntentCategory::SCHEMA;
+                            if (intent.statement.drop_user)
+                                intent.tables = {intent.statement.drop_user->name};
+                            intent.is_write = true;
+                            break;
+                        case StatementType::USE_DATABASE:
+                            intent.category = IntentCategory::TASK;
+                            intent.is_write = false;
+                            break;
+                        case StatementType::SHOW_DATABASES:
+                            intent.category = IntentCategory::QUERY;
+                            intent.is_write = false;
+                            break;
+                        case StatementType::SHOW_USERS:
+                            intent.category = IntentCategory::QUERY;
+                            intent.is_write = false;
+                            break;
+                        case StatementType::SHOW_SCHEMAS:
+                            intent.category = IntentCategory::QUERY;
+                            intent.is_write = false;
+                            break;
                         default:
                             break;
                     }
@@ -286,6 +366,81 @@ std::string JiamiaoDBServer::process_query(const std::string& input) {
                         json r;
                         r["type"] = "ddl_result";
                         r["message"] = "已删除表 " + intent.statement.drop_table->name;
+                        results_arr.push_back(r);
+                        continue;
+                    }
+                    if (intent.statement.type == StatementType::CREATE_DATABASE && intent.statement.create_database) {
+                        storage_->create_database(intent.statement.create_database->name);
+                        json r;
+                        r["type"] = "ddl_result";
+                        r["message"] = "已创建数据库 " + intent.statement.create_database->name;
+                        results_arr.push_back(r);
+                        continue;
+                    }
+                    if (intent.statement.type == StatementType::DROP_DATABASE && intent.statement.drop_database) {
+                        storage_->drop_database(intent.statement.drop_database->name);
+                        json r;
+                        r["type"] = "ddl_result";
+                        r["message"] = "已删除数据库 " + intent.statement.drop_database->name;
+                        results_arr.push_back(r);
+                        continue;
+                    }
+                    if (intent.statement.type == StatementType::CREATE_SCHEMA && intent.statement.create_schema) {
+                        storage_->create_schema(storage_->current_db(), intent.statement.create_schema->name);
+                        json r;
+                        r["type"] = "ddl_result";
+                        r["message"] = "已创建模式 " + intent.statement.create_schema->name;
+                        results_arr.push_back(r);
+                        continue;
+                    }
+                    if (intent.statement.type == StatementType::CREATE_USER && intent.statement.create_user) {
+                        storage_->create_user(intent.statement.create_user->name,
+                                             intent.statement.create_user->password);
+                        json r;
+                        r["type"] = "ddl_result";
+                        r["message"] = "已创建用户 " + intent.statement.create_user->name;
+                        results_arr.push_back(r);
+                        continue;
+                    }
+                    if (intent.statement.type == StatementType::DROP_USER && intent.statement.drop_user) {
+                        storage_->drop_user(intent.statement.drop_user->name);
+                        json r;
+                        r["type"] = "ddl_result";
+                        r["message"] = "已删除用户 " + intent.statement.drop_user->name;
+                        results_arr.push_back(r);
+                        continue;
+                    }
+                    if (intent.statement.type == StatementType::USE_DATABASE && intent.statement.use_database) {
+                        storage_->set_current_db(intent.statement.use_database->name);
+                        json r;
+                        r["type"] = "ddl_result";
+                        r["message"] = "已切换到数据库 " + intent.statement.use_database->name;
+                        results_arr.push_back(r);
+                        continue;
+                    }
+                    if (intent.statement.type == StatementType::SHOW_DATABASES) {
+                        auto dbs = storage_->list_databases();
+                        json r;
+                        r["type"] = "database_list";
+                        r["current"] = storage_->current_db();
+                        { json arr = json::array(); for (const auto& d : dbs) arr.push_back(d); r["databases"] = arr; }
+                        results_arr.push_back(r);
+                        continue;
+                    }
+                    if (intent.statement.type == StatementType::SHOW_USERS) {
+                        auto users = storage_->list_users();
+                        json r;
+                        r["type"] = "user_list";
+                        { json arr = json::array(); for (const auto& u : users) arr.push_back(u); r["users"] = arr; }
+                        results_arr.push_back(r);
+                        continue;
+                    }
+                    if (intent.statement.type == StatementType::SHOW_SCHEMAS) {
+                        auto schemas = storage_->list_schemas(storage_->current_db());
+                        json r;
+                        r["type"] = "schema_list";
+                        r["database"] = storage_->current_db();
+                        { json arr = json::array(); for (const auto& s : schemas) arr.push_back(s); r["schemas"] = arr; }
                         results_arr.push_back(r);
                         continue;
                     }
@@ -402,21 +557,32 @@ std::string JiamiaoDBServer::process_query(const std::string& input) {
 }
 
 std::string JiamiaoDBServer::build_schema_context() {
-    auto tables = storage_->list_tables();
-    if (tables.empty()) return "（当前没有表）";
-
     std::string ctx;
-    for (const auto& name : tables) {
-        auto* s = storage_->get_schema(name);
-        if (!s) continue;
-        ctx += name + " (" + std::to_string(s->row_count) + " 行): ";
-        for (size_t i = 0; i < s->columns.size(); i++) {
-            if (i > 0) ctx += ", ";
-            ctx += s->columns[i].name + " " + data_type_name(s->columns[i].type);
-            if (s->columns[i].primary_key) ctx += " PK";
-            if (!s->columns[i].nullable) ctx += " NOT NULL";
+    ctx += "当前数据库: " + storage_->current_db() + "\n";
+    ctx += "可用数据库: ";
+    auto dbs = storage_->list_databases();
+    for (size_t i = 0; i < dbs.size(); i++) {
+        if (i > 0) ctx += ", ";
+        ctx += dbs[i];
+    }
+    ctx += "\n";
+
+    auto tables = storage_->list_tables();
+    if (tables.empty()) {
+        ctx += "（当前数据库没有表）\n";
+    } else {
+        for (const auto& name : tables) {
+            auto* s = storage_->get_schema(name);
+            if (!s) continue;
+            ctx += name + " (" + std::to_string(s->row_count) + " 行): ";
+            for (size_t i = 0; i < s->columns.size(); i++) {
+                if (i > 0) ctx += ", ";
+                ctx += s->columns[i].name + " " + data_type_name(s->columns[i].type);
+                if (s->columns[i].primary_key) ctx += " PK";
+                if (!s->columns[i].nullable) ctx += " NOT NULL";
+            }
+            ctx += "\n";
         }
-        ctx += "\n";
     }
     return ctx;
 }
@@ -436,6 +602,7 @@ bool JiamiaoDBServer::is_likely_sql(const std::string& input) {
 
     return starts_with("SELECT") || starts_with("INSERT") || starts_with("UPDATE") ||
            starts_with("DELETE") || starts_with("CREATE") || starts_with("DROP") ||
-           starts_with("ALTER") || starts_with("SHOW") || starts_with("BEGIN") ||
-           starts_with("COMMIT") || starts_with("ROLLBACK") || starts_with("TRUNCATE");
+           starts_with("ALTER") || starts_with("SHOW") || starts_with("USE") ||
+           starts_with("BEGIN") || starts_with("COMMIT") || starts_with("ROLLBACK") ||
+           starts_with("TRUNCATE");
 }

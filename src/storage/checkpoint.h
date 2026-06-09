@@ -27,6 +27,7 @@ struct Checkpoint {
     std::map<std::string, json> indexes;
     uint32_t next_xid = 3;          // FirstNormalTransactionId
     json clog_entries;              // CLog 序列化数据
+    json catalog_data;              // Catalog 序列化数据
 
     json to_json() const;
     static Checkpoint from_json(const json& j);

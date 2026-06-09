@@ -40,9 +40,17 @@ private:
     Statement parse_insert();
     Statement parse_update();
     Statement parse_delete();
+    Statement parse_create();
     Statement parse_create_table();
     Statement parse_drop_table();
     Statement parse_create_index();
+    Statement parse_create_database();
+    Statement parse_create_schema();
+    Statement parse_create_user();
+    Statement parse_drop_database();
+    Statement parse_drop_user();
+    Statement parse_use();
+    Statement parse_show();
     Statement parse_begin();
     Statement parse_commit();
     Statement parse_rollback();

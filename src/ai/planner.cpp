@@ -67,6 +67,15 @@ std::string AIPlanner::choose_initial_strategy(const UnifiedIntent& intent, cons
         case StatementType::DELETE: return ast.delete_stmt && ast.delete_stmt->where ? "delete_with_where" : "delete";
         case StatementType::CREATE_TABLE: return "ddl_create";
         case StatementType::DROP_TABLE: return "ddl_drop";
+        case StatementType::CREATE_DATABASE: return "ddl_create_db";
+        case StatementType::DROP_DATABASE: return "ddl_drop_db";
+        case StatementType::CREATE_SCHEMA: return "ddl_create_schema";
+        case StatementType::CREATE_USER: return "ddl_create_user";
+        case StatementType::DROP_USER: return "ddl_drop_user";
+        case StatementType::USE_DATABASE: return "use_db";
+        case StatementType::SHOW_DATABASES: return "show_dbs";
+        case StatementType::SHOW_USERS: return "show_users";
+        case StatementType::SHOW_SCHEMAS: return "show_schemas";
         default: return "full_scan";
     }
 }
@@ -183,6 +192,54 @@ Pipeline AIPlanner::build_pipeline(const UnifiedIntent& intent, const Statement&
             pipeline.push_back(std::move(op));
             break;
         }
+        case StatementType::CREATE_DATABASE: {
+            if (!ast.create_database) break;
+            PipelineOp op;
+            op.type = PipelineOpType::CREATE_DATABASE;
+            op.table = ast.create_database->name;
+            pipeline.push_back(std::move(op));
+            break;
+        }
+        case StatementType::DROP_DATABASE: {
+            if (!ast.drop_database) break;
+            PipelineOp op;
+            op.type = PipelineOpType::DROP_DATABASE;
+            op.table = ast.drop_database->name;
+            pipeline.push_back(std::move(op));
+            break;
+        }
+        case StatementType::CREATE_SCHEMA: {
+            if (!ast.create_schema) break;
+            PipelineOp op;
+            op.type = PipelineOpType::CREATE_SCHEMA;
+            op.table = ast.create_schema->name;
+            pipeline.push_back(std::move(op));
+            break;
+        }
+        case StatementType::CREATE_USER: {
+            if (!ast.create_user) break;
+            PipelineOp op;
+            op.type = PipelineOpType::CREATE_USER;
+            op.table = ast.create_user->name;
+            pipeline.push_back(std::move(op));
+            break;
+        }
+        case StatementType::DROP_USER: {
+            if (!ast.drop_user) break;
+            PipelineOp op;
+            op.type = PipelineOpType::DROP_USER;
+            op.table = ast.drop_user->name;
+            pipeline.push_back(std::move(op));
+            break;
+        }
+        case StatementType::USE_DATABASE: {
+            if (!ast.use_database) break;
+            PipelineOp op;
+            op.type = PipelineOpType::USE_DATABASE;
+            op.table = ast.use_database->name;
+            pipeline.push_back(std::move(op));
+            break;
+        }
         default:
             break;
     }
@@ -240,6 +297,12 @@ std::string AIPlanner::pipeline_signature(const Pipeline& pipeline) {
             case PipelineOpType::DELETE: sig += "delete"; break;
             case PipelineOpType::CREATE_TABLE: sig += "createTable"; break;
             case PipelineOpType::DROP_TABLE: sig += "dropTable"; break;
+            case PipelineOpType::CREATE_DATABASE: sig += "createDb"; break;
+            case PipelineOpType::DROP_DATABASE: sig += "dropDb"; break;
+            case PipelineOpType::CREATE_SCHEMA: sig += "createSchema"; break;
+            case PipelineOpType::CREATE_USER: sig += "createUser"; break;
+            case PipelineOpType::DROP_USER: sig += "dropUser"; break;
+            case PipelineOpType::USE_DATABASE: sig += "useDb"; break;
             default: sig += "?";
         }
     }

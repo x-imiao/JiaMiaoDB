@@ -161,6 +161,15 @@ enum class StatementType {
     CREATE_TABLE,
     DROP_TABLE,
     CREATE_INDEX,
+    CREATE_DATABASE,
+    DROP_DATABASE,
+    CREATE_SCHEMA,
+    CREATE_USER,
+    DROP_USER,
+    USE_DATABASE,
+    SHOW_DATABASES,
+    SHOW_USERS,
+    SHOW_SCHEMAS,
     BEGIN_TRANSACTION,
     COMMIT_TRANSACTION,
     ROLLBACK_TRANSACTION,
@@ -205,6 +214,32 @@ struct CreateIndexStmt {
     std::string index_name;
 };
 
+struct CreateDatabaseStmt {
+    std::string name;
+};
+
+struct DropDatabaseStmt {
+    std::string name;
+};
+
+struct CreateSchemaStmt {
+    std::string database; // empty = current db
+    std::string name;
+};
+
+struct CreateUserStmt {
+    std::string name;
+    std::string password;
+};
+
+struct DropUserStmt {
+    std::string name;
+};
+
+struct UseDatabaseStmt {
+    std::string name;
+};
+
 struct Statement {
     StatementType type = StatementType::UNKNOWN;
     std::unique_ptr<SelectStmt> select;
@@ -214,6 +249,12 @@ struct Statement {
     std::unique_ptr<CreateTableStmt> create_table;
     std::unique_ptr<DropTableStmt> drop_table;
     std::unique_ptr<CreateIndexStmt> create_index;
+    std::unique_ptr<CreateDatabaseStmt> create_database;
+    std::unique_ptr<DropDatabaseStmt> drop_database;
+    std::unique_ptr<CreateSchemaStmt> create_schema;
+    std::unique_ptr<CreateUserStmt> create_user;
+    std::unique_ptr<DropUserStmt> drop_user;
+    std::unique_ptr<UseDatabaseStmt> use_database;
 };
 
 // ── UnifiedIntent ──
@@ -243,7 +284,13 @@ enum class PipelineOpType {
     DELETE,
     CREATE_TABLE,
     DROP_TABLE,
-    CREATE_INDEX
+    CREATE_INDEX,
+    CREATE_DATABASE,
+    DROP_DATABASE,
+    CREATE_SCHEMA,
+    CREATE_USER,
+    DROP_USER,
+    USE_DATABASE
 };
 
 struct PipelineOp {

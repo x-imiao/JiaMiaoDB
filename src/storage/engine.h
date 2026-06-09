@@ -11,6 +11,7 @@
 #include "wal.h"
 #include "checkpoint.h"
 #include "transaction.h"
+#include "catalog.h"
 
 /* ═══════════════════════════════════════════════════════
    StorageEngine — 存储引擎
@@ -36,11 +37,25 @@ public:
     void save();
     void close();
 
+    // Catalog
+    Catalog* catalog() { return catalog_.get(); }
+    void create_database(const std::string& name);
+    void drop_database(const std::string& name);
+    void create_schema(const std::string& db_name, const std::string& schema_name);
+    void create_user(const std::string& name, const std::string& password);
+    void drop_user(const std::string& name);
+    std::string current_db() const;
+    void set_current_db(const std::string& name);
+    std::vector<std::string> list_databases();
+    std::vector<std::string> list_users();
+    std::vector<std::string> list_schemas(const std::string& db_name);
+
     // Schema
     void create_table(const std::string& name, const std::vector<ColumnDef>& columns);
     void drop_table(const std::string& name);
     TableSchema* get_schema(const std::string& name);
     std::vector<std::string> list_tables();
+    std::string resolve_table_name(const std::string& name) const;
 
     // 数据
     Row insert(const std::string& table, const Row& row);
@@ -81,6 +96,7 @@ private:
     std::unique_ptr<WriteAheadLog> wal_;
     std::unique_ptr<CheckpointManager> ckp_mgr_;
     std::unique_ptr<jiamiao::TransactionManager> txn_mgr_;
+    std::unique_ptr<Catalog> catalog_;
 
     std::string data_dir_;
     int checkpoint_interval_;

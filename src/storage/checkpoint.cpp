@@ -42,6 +42,7 @@ json Checkpoint::to_json() const {
     j["indexes"] = indexes;
     j["next_xid"] = static_cast<int64_t>(next_xid);
     j["clog"] = clog_entries;
+    j["catalog"] = catalog_data;
     return j;
 }
 
@@ -86,6 +87,9 @@ Checkpoint Checkpoint::from_json(const json& j) {
     }
     if (j.contains("clog")) {
         ckp.clog_entries = j["clog"];
+    }
+    if (j.contains("catalog")) {
+        ckp.catalog_data = j["catalog"];
     }
 
     return ckp;

@@ -26,6 +26,7 @@ struct ServerConfig {
     int port = 9615;
     int max_connections = 128;
     int worker_threads = 4;
+    std::string default_database = "defaultdb";
 };
 
 struct StorageConfig {
@@ -66,6 +67,7 @@ struct DBConfig {
                 if (s.contains("port")) cfg.server.port = (int)s["port"].get_int();
                 if (s.contains("max_connections")) cfg.server.max_connections = (int)s["max_connections"].get_int();
                 if (s.contains("worker_threads")) cfg.server.worker_threads = (int)s["worker_threads"].get_int();
+                if (s.contains("default_database")) cfg.server.default_database = s["default_database"].get_string();
             }
             if (j.contains("storage")) {
                 auto& s = j["storage"];

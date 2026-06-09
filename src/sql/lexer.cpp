@@ -25,6 +25,11 @@ std::string Token::to_string() const {
         {TokenType::RELEASE, "RELEASE"}, {TokenType::TRANSACTION, "TRANSACTION"},
         {TokenType::ABORT, "ABORT"}, {TokenType::START, "START"},
         {TokenType::TO, "TO"},
+        {TokenType::DATABASE, "DATABASE"}, {TokenType::SCHEMA, "SCHEMA"},
+        {TokenType::USER, "USER"}, {TokenType::PASSWORD, "PASSWORD"},
+        {TokenType::WITH, "WITH"}, {TokenType::USE, "USE"},
+        {TokenType::SHOW, "SHOW"}, {TokenType::DATABASES, "DATABASES"},
+        {TokenType::USERS, "USERS"}, {TokenType::SCHEMAS, "SCHEMAS"},
         {TokenType::IDENTIFIER, "ID"}, {TokenType::INTEGER_LIT, "INT"},
         {TokenType::FLOAT_LIT, "FLOAT"}, {TokenType::STRING_LIT, "STR"},
         {TokenType::BOOL_LIT, "BOOL"},
@@ -116,6 +121,11 @@ Token Lexer::read_identifier() {
         {"RELEASE", TokenType::RELEASE}, {"TRANSACTION", TokenType::TRANSACTION},
         {"ABORT", TokenType::ABORT}, {"START", TokenType::START},
         {"TO", TokenType::TO},
+        {"DATABASE", TokenType::DATABASE}, {"SCHEMA", TokenType::SCHEMA},
+        {"USER", TokenType::USER}, {"PASSWORD", TokenType::PASSWORD},
+        {"WITH", TokenType::WITH}, {"USE", TokenType::USE},
+        {"SHOW", TokenType::SHOW}, {"DATABASES", TokenType::DATABASES},
+        {"USERS", TokenType::USERS}, {"SCHEMAS", TokenType::SCHEMAS},
     };
 
     auto it = keywords.find(up);
