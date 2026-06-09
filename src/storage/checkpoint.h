@@ -3,6 +3,7 @@
 
 #include <string>
 #include <vector>
+#include <cstdint>
 #include "../types.h"
 #include "json.h"
 
@@ -24,6 +25,8 @@ struct Checkpoint {
     std::map<std::string, json> table_data;
     std::map<std::string, int64_t> row_id_counters;
     std::map<std::string, json> indexes;
+    uint32_t next_xid = 3;          // FirstNormalTransactionId
+    json clog_entries;              // CLog 序列化数据
 
     json to_json() const;
     static Checkpoint from_json(const json& j);

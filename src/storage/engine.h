@@ -1,7 +1,7 @@
 #ifndef JIAMIAODB_STORAGE_ENGINE_H
 #define JIAMIAODB_STORAGE_ENGINE_H
 
-#include <bits/std_function.h>
+#include <functional>
 #include <string>
 #include <vector>
 #include <map>
@@ -10,6 +10,7 @@
 #include "../types.h"
 #include "wal.h"
 #include "checkpoint.h"
+#include "transaction.h"
 
 /* ═══════════════════════════════════════════════════════
    StorageEngine — 存储引擎
@@ -47,10 +48,21 @@ public:
     int64_t update(const std::string& table, std::function<bool(const Row&)> match, const std::map<std::string, Value>& updates);
     int64_t remove(const std::string& table, std::function<bool(const Row&)> match);
 
+    // 事务感知的数据操作
+    jiamiao::TransactionManager& txn_mgr();
+    Row insert_with_txn(const std::string& table, const Row& row);
+    int64_t update_with_txn(const std::string& table, std::function<bool(const Row&)> match, const std::map<std::string, Value>& updates);
+    int64_t remove_with_txn(const std::string& table, std::function<bool(const Row&)> match);
+
     // 索引
     RowSet index_lookup(const std::string& table, const std::string& column, const Value& value);
     bool has_index(const std::string& table, const std::string& column);
     void create_index(const std::string& table, const std::string& column);
+
+    // 事务 WAL 与 Undo
+    void apply_undo();
+    void write_xact_commit(jiamiao::TransactionId xid);
+    void write_xact_abort(jiamiao::TransactionId xid);
 
 private:
     // 内部状态
@@ -61,6 +73,7 @@ private:
 
     std::unique_ptr<WriteAheadLog> wal_;
     std::unique_ptr<CheckpointManager> ckp_mgr_;
+    std::unique_ptr<jiamiao::TransactionManager> txn_mgr_;
 
     std::string data_dir_;
     int checkpoint_interval_;
@@ -79,7 +92,8 @@ private:
 
     // WAL 写入
     int64_t next_seq();
-    void write_wal(const std::string& op, const std::string& table, const json& data);
+    void write_wal(const std::string& op, const std::string& table, const json& data,
+                   jiamiao::TransactionId xid = jiamiao::InvalidTransactionId);
     int64_t wal_seq_ = 0;
 };
 

@@ -1,4 +1,5 @@
 #include "engine.h"
+#include "transaction.h"
 #include <filesystem>
 #include <iostream>
 #include <algorithm>
@@ -14,6 +15,7 @@ StorageEngine::StorageEngine(const std::string& data_dir, int checkpoint_interva
     }
     wal_ = std::make_unique<WriteAheadLog>(data_dir + "/wal.log");
     ckp_mgr_ = std::make_unique<CheckpointManager>(data_dir);
+    txn_mgr_ = std::make_unique<jiamiao::TransactionManager>();
 }
 
 StorageEngine::~StorageEngine() { close(); }
@@ -67,7 +69,17 @@ void StorageEngine::load() {
         }
     }
 
-    // 2. 重放 WAL
+    // 2. 恢复事务状态
+    if (ckp.next_xid >= jiamiao::FirstNormalTransactionId) {
+        txn_mgr_->set_next_xid(ckp.next_xid);
+    }
+    if (!ckp.clog_entries.is_null()) {
+        txn_mgr_->clog().from_json(ckp.clog_entries);
+    }
+    txn_mgr_->rebuild_active_from_clog();
+    txn_mgr_->reset_context();
+
+    // 3. 重放 WAL
     wal_->open();
     auto records = wal_->replay(ckp.last_seq);
     for (const auto& rec : records) {
@@ -287,6 +299,226 @@ int64_t StorageEngine::remove(const std::string& table, std::function<bool(const
     return to_delete.size();
 }
 
+/* ─── 事务感知操作 ─── */
+
+jiamiao::TransactionManager& StorageEngine::txn_mgr() {
+    return *txn_mgr_;
+}
+
+Row StorageEngine::insert_with_txn(const std::string& table, const Row& row) {
+    std::lock_guard<std::mutex> lock(global_mutex_);
+    auto schema_it = tables_.find(table);
+    if (schema_it == tables_.end()) {
+        throw std::runtime_error("表 \"" + table + "\" 不存在");
+    }
+
+    auto validated = validate(schema_it->second, row);
+    int64_t id = row_ids_[table] + 1;
+    row_ids_[table] = id;
+    validated["_rowid"] = id;
+
+    // 分配 XID (首次写触发)
+    jiamiao::TransactionId xid = txn_mgr_->assign_xid();
+    validated["_xmin"] = static_cast<int64_t>(xid);
+
+    // 注册 Undo 记录
+    txn_mgr_->add_undo_record(jiamiao::UndoRecord(
+        jiamiao::UndoOp::INSERT, table, id, {}, validated));
+
+    // WAL
+    json row_json;
+    for (const auto& [k, v] : validated) {
+        std::visit([&](auto&& val) {
+            using T = std::decay_t<decltype(val)>;
+            if constexpr (std::is_same_v<T, std::nullptr_t>) row_json[k] = nullptr;
+            else if constexpr (std::is_same_v<T, int64_t>) row_json[k] = val;
+            else if constexpr (std::is_same_v<T, double>) row_json[k] = val;
+            else if constexpr (std::is_same_v<T, bool>) row_json[k] = val;
+            else if constexpr (std::is_same_v<T, std::string>) row_json[k] = val;
+        }, v);
+    }
+    json data;
+    data["row"] = row_json;
+    data["rowid"] = id;
+    write_wal("insert", table, data, xid);
+
+    data_[table].push_back(validated);
+    update_indexes(table, data_[table].size() - 1, validated);
+    schema_it->second.row_count = data_[table].size();
+    maybe_checkpoint();
+
+    return validated;
+}
+
+int64_t StorageEngine::update_with_txn(const std::string& table,
+                                        std::function<bool(const Row&)> match,
+                                        const std::map<std::string, Value>& updates) {
+    std::lock_guard<std::mutex> lock(global_mutex_);
+    auto rows_it = data_.find(table);
+    if (rows_it == data_.end()) {
+        throw std::runtime_error("表 \"" + table + "\" 不存在");
+    }
+
+    jiamiao::TransactionId xid = txn_mgr_->assign_xid();
+    bool index_affected = updates_affect_index(table, updates);
+    int64_t count = 0;
+
+    for (auto& row : rows_it->second) {
+        if (match(row)) {
+            // 保存旧行用于 Undo
+            Row old_row = row;
+            int64_t rowid = std::get<int64_t>(row.at("_rowid"));
+
+            // 注册 Undo
+            Row new_row = row;
+            for (const auto& [k, v] : updates) {
+                new_row[k] = v;
+            }
+            new_row["_xmin"] = static_cast<int64_t>(xid);
+            txn_mgr_->add_undo_record(jiamiao::UndoRecord(
+                jiamiao::UndoOp::UPDATE, table, rowid, old_row, new_row));
+
+            // WAL
+            json upd_json;
+            for (const auto& [k, v] : updates) {
+                std::visit([&](auto&& val) {
+                    using T = std::decay_t<decltype(val)>;
+                    if constexpr (std::is_same_v<T, std::nullptr_t>) upd_json[k] = nullptr;
+                    else if constexpr (std::is_same_v<T, int64_t>) upd_json[k] = val;
+                    else if constexpr (std::is_same_v<T, double>) upd_json[k] = val;
+                    else if constexpr (std::is_same_v<T, bool>) upd_json[k] = val;
+                    else if constexpr (std::is_same_v<T, std::string>) upd_json[k] = val;
+                }, v);
+            }
+            json data;
+            data["rowid"] = rowid;
+            data["updates"] = upd_json;
+            write_wal("update", table, data, xid);
+
+            // 应用更新
+            for (const auto& [k, v] : updates) {
+                row[k] = v;
+            }
+            row["_xmin"] = static_cast<int64_t>(xid);
+            count++;
+        }
+    }
+
+    if (index_affected) rebuild_indexes(table);
+    maybe_checkpoint();
+    return count;
+}
+
+int64_t StorageEngine::remove_with_txn(const std::string& table,
+                                        std::function<bool(const Row&)> match) {
+    std::lock_guard<std::mutex> lock(global_mutex_);
+    auto rows_it = data_.find(table);
+    if (rows_it == data_.end()) {
+        throw std::runtime_error("表 \"" + table + "\" 不存在");
+    }
+
+    jiamiao::TransactionId xid = txn_mgr_->assign_xid();
+    auto& rows = rows_it->second;
+    std::vector<int64_t> to_delete;
+
+    for (size_t i = 0; i < rows.size(); i++) {
+        if (match(rows[i])) {
+            int64_t rowid = std::get<int64_t>(rows[i].at("_rowid"));
+
+            // 注册 Undo
+            txn_mgr_->add_undo_record(jiamiao::UndoRecord(
+                jiamiao::UndoOp::DELETE, table, rowid, rows[i], {}));
+
+            // WAL
+            json data;
+            data["rowid"] = rowid;
+            write_wal("delete", table, data, xid);
+
+            to_delete.push_back(i);
+        }
+    }
+
+    // 从后往前删除
+    RowSet kept;
+    for (size_t i = 0; i < rows.size(); i++) {
+        if (std::find(to_delete.begin(), to_delete.end(), (int64_t)i) == to_delete.end()) {
+            kept.push_back(std::move(rows[i]));
+        }
+    }
+
+    data_[table] = std::move(kept);
+    rebuild_indexes(table);
+
+    auto schema_it = tables_.find(table);
+    if (schema_it != tables_.end()) {
+        schema_it->second.row_count = data_[table].size();
+    }
+
+    maybe_checkpoint();
+    return to_delete.size();
+}
+
+void StorageEngine::apply_undo() {
+    const auto& records = txn_mgr_->undo_records();
+
+    // 反向遍历 undo records (后进先出)
+    for (auto it = records.rbegin(); it != records.rend(); ++it) {
+        const auto& rec = *it;
+        auto data_it = data_.find(rec.table_name);
+        if (data_it == data_.end()) continue;
+        auto& rows = data_it->second;
+
+        switch (rec.op) {
+        case jiamiao::UndoOp::INSERT:
+            // 回滚 INSERT = 删除插入的行
+            for (size_t i = 0; i < rows.size(); i++) {
+                auto rit = rows[i].find("_rowid");
+                if (rit != rows[i].end() && std::get<int64_t>(rit->second) == rec.row_id) {
+                    rows.erase(rows.begin() + i);
+                    break;
+                }
+            }
+            break;
+
+        case jiamiao::UndoOp::UPDATE:
+            // 回滚 UPDATE = 恢复旧行
+            for (size_t i = 0; i < rows.size(); i++) {
+                auto rit = rows[i].find("_rowid");
+                if (rit != rows[i].end() && std::get<int64_t>(rit->second) == rec.row_id) {
+                    rows[i] = rec.old_row;  // 恢复旧行（含原始 _xmin）
+                    rows[i]["_rowid"] = rec.row_id;
+                    break;
+                }
+            }
+            break;
+
+        case jiamiao::UndoOp::DELETE:
+            // 回滚 DELETE = 重新插入旧行
+            rows.push_back(rec.old_row);
+            break;
+        }
+    }
+
+    // 重建受影响的索引
+    for (auto it = records.rbegin(); it != records.rend(); ++it) {
+        rebuild_indexes(it->table_name);
+    }
+}
+
+void StorageEngine::write_xact_commit(jiamiao::TransactionId xid) {
+    std::lock_guard<std::mutex> lock(global_mutex_);
+    json data;
+    data["_xid"] = static_cast<int64_t>(xid);
+    write_wal("xact_commit", "", data, xid);
+}
+
+void StorageEngine::write_xact_abort(jiamiao::TransactionId xid) {
+    std::lock_guard<std::mutex> lock(global_mutex_);
+    json data;
+    data["_xid"] = static_cast<int64_t>(xid);
+    write_wal("xact_abort", "", data, xid);
+}
+
 /* ─── 索引 ─── */
 
 RowSet StorageEngine::index_lookup(const std::string& table, const std::string& column, const Value& value) {
@@ -376,7 +608,33 @@ void StorageEngine::replay_record(const WALRecord& rec) {
         return;
     }
 
+    if (rec.op == "xact_commit") {
+        if (rec.data.contains("_xid")) {
+            jiamiao::TransactionId xid = static_cast<jiamiao::TransactionId>(
+                rec.data["_xid"].get_int());
+            txn_mgr_->clog().set_status(xid, jiamiao::TransactionStatus::COMMITTED);
+        }
+        return;
+    }
+
+    if (rec.op == "xact_abort") {
+        if (rec.data.contains("_xid")) {
+            jiamiao::TransactionId xid = static_cast<jiamiao::TransactionId>(
+                rec.data["_xid"].get_int());
+            txn_mgr_->clog().set_status(xid, jiamiao::TransactionStatus::ABORTED);
+        }
+        return;
+    }
+
     if (rec.op == "insert") {
+        // 事务过滤: 跳过未提交或已回滚的记录
+        if (rec.data.contains("_xid")) {
+            jiamiao::TransactionId xid = static_cast<jiamiao::TransactionId>(
+                rec.data["_xid"].get_int());
+            auto status = txn_mgr_->clog().get_status(xid);
+            if (status != jiamiao::TransactionStatus::COMMITTED) return;
+        }
+
         auto& rows = data_[rec.table];
         if (rows.empty() && !tables_.count(rec.table)) return;
 
@@ -403,6 +661,14 @@ void StorageEngine::replay_record(const WALRecord& rec) {
     }
 
     if (rec.op == "update") {
+        // 事务过滤
+        if (rec.data.contains("_xid")) {
+            jiamiao::TransactionId xid = static_cast<jiamiao::TransactionId>(
+                rec.data["_xid"].get_int());
+            auto status = txn_mgr_->clog().get_status(xid);
+            if (status != jiamiao::TransactionStatus::COMMITTED) return;
+        }
+
         auto rows_it = data_.find(rec.table);
         if (rows_it == data_.end()) return;
 
@@ -433,6 +699,14 @@ void StorageEngine::replay_record(const WALRecord& rec) {
     }
 
     if (rec.op == "delete") {
+        // 事务过滤
+        if (rec.data.contains("_xid")) {
+            jiamiao::TransactionId xid = static_cast<jiamiao::TransactionId>(
+                rec.data["_xid"].get_int());
+            auto status = txn_mgr_->clog().get_status(xid);
+            if (status != jiamiao::TransactionStatus::COMMITTED) return;
+        }
+
         auto rows_it = data_.find(rec.table);
         if (rows_it == data_.end()) return;
 
@@ -500,6 +774,10 @@ void StorageEngine::checkpoint() {
         }
         ckp.indexes[name] = idx_arr;
     }
+
+    // 序列化事务状态
+    ckp.next_xid = txn_mgr_->get_next_xid();
+    ckp.clog_entries = txn_mgr_->clog().to_json();
 
     wal_->sync();
     ckp_mgr_->save(ckp);
@@ -601,8 +879,13 @@ int64_t StorageEngine::next_seq() {
     return ++wal_seq_;
 }
 
-void StorageEngine::write_wal(const std::string& op, const std::string& table, const json& data) {
+void StorageEngine::write_wal(const std::string& op, const std::string& table,
+                               const json& data, jiamiao::TransactionId xid) {
     int64_t seq = next_seq();
-    WALRecord rec{seq, time(nullptr), op, table, data};
+    json enriched = data;
+    if (xid != jiamiao::InvalidTransactionId) {
+        enriched["_xid"] = static_cast<int64_t>(xid);
+    }
+    WALRecord rec{seq, time(nullptr), op, table, enriched};
     wal_->append(rec);
 }

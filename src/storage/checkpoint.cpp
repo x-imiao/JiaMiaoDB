@@ -40,6 +40,8 @@ json Checkpoint::to_json() const {
     j["row_id_counters"] = counters;
 
     j["indexes"] = indexes;
+    j["next_xid"] = static_cast<int64_t>(next_xid);
+    j["clog"] = clog_entries;
     return j;
 }
 
@@ -78,6 +80,12 @@ Checkpoint Checkpoint::from_json(const json& j) {
         for (auto it = j["indexes"].obj_begin(); it != j["indexes"].obj_end(); ++it) {
             ckp.indexes[it->first] = it->second;
         }
+    }
+    if (j.contains("next_xid")) {
+        ckp.next_xid = static_cast<uint32_t>(j["next_xid"].get_int());
+    }
+    if (j.contains("clog")) {
+        ckp.clog_entries = j["clog"];
     }
 
     return ckp;

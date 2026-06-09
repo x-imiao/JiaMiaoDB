@@ -2,7 +2,7 @@
 #include "planner.h"
 #include "memory.h"
 #include "../storage/engine.h"
-#include <bits/std_function.h>
+#include <functional>
 #include <iostream>
 #include <algorithm>
 #include <cmath>
@@ -127,7 +127,7 @@ ResultSet PipelineExecutor::execute_standalone(const PipelineOp& op) {
         case PipelineOpType::INSERT: {
             int64_t count = 0;
             for (const auto& row : op.insert_rows) {
-                storage_->insert(op.table, row);
+                storage_->insert_with_txn(op.table, row);
                 count++;
             }
             return {{}, {}, count, "插入 " + std::to_string(count) + " 行"};
@@ -138,7 +138,7 @@ ResultSet PipelineExecutor::execute_standalone(const PipelineOp& op) {
                 Value v = eval_expression(op.filter.get(), row);
                 return std::get_if<bool>(&v) && *std::get_if<bool>(&v);
             };
-            int64_t count = storage_->update(op.table, match_fn, op.update_values);
+            int64_t count = storage_->update_with_txn(op.table, match_fn, op.update_values);
             return {{}, {}, count, "更新 " + std::to_string(count) + " 行"};
         }
         case PipelineOpType::DELETE: {
@@ -147,7 +147,7 @@ ResultSet PipelineExecutor::execute_standalone(const PipelineOp& op) {
                 Value v = eval_expression(op.filter.get(), row);
                 return std::get_if<bool>(&v) && *std::get_if<bool>(&v);
             };
-            int64_t count = storage_->remove(op.table, match_fn);
+            int64_t count = storage_->remove_with_txn(op.table, match_fn);
             return {{}, {}, count, "删除 " + std::to_string(count) + " 行"};
         }
         case PipelineOpType::CREATE_TABLE: {

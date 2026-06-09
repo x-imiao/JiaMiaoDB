@@ -49,6 +49,9 @@ Statement Parser::parse_statement() {
         case TokenType::DELETE: return parse_delete();
         case TokenType::CREATE: return parse_create_table();
         case TokenType::DROP: return parse_drop_table();
+        case TokenType::BEGIN: return parse_begin();
+        case TokenType::COMMIT: return parse_commit();
+        case TokenType::ROLLBACK: return parse_rollback();
         default:
             throw ParseError("不支持的语句，以 '" + peek().text + "' 开头");
     }
@@ -263,6 +266,58 @@ Statement Parser::parse_create_index() {
     Statement s;
     s.type = StatementType::CREATE_INDEX;
     s.create_index = std::move(stmt);
+    return s;
+}
+
+/* ─── BEGIN ─── */
+
+Statement Parser::parse_begin() {
+    expect(TokenType::BEGIN, "期望 BEGIN");
+    // 可选 TRANSACTION / WORK
+    if (match(TokenType::TRANSACTION)) {}
+    else if (check(TokenType::IDENTIFIER)) {
+        auto up = peek().text;
+        for (auto& c : up) c = toupper(c);
+        if (up == "WORK" || up == "TRANSACTION") advance();
+    }
+
+    Statement s;
+    s.type = StatementType::BEGIN_TRANSACTION;
+    return s;
+}
+
+/* ─── COMMIT ─── */
+
+Statement Parser::parse_commit() {
+    expect(TokenType::COMMIT, "期望 COMMIT");
+    // 可选 TRANSACTION / WORK
+    if (match(TokenType::TRANSACTION)) {}
+    else if (check(TokenType::IDENTIFIER)) {
+        auto up = peek().text;
+        for (auto& c : up) c = toupper(c);
+        if (up == "WORK" || up == "TRANSACTION") advance();
+    }
+
+    Statement s;
+    s.type = StatementType::COMMIT_TRANSACTION;
+    return s;
+}
+
+/* ─── ROLLBACK ─── */
+
+Statement Parser::parse_rollback() {
+    expect(TokenType::ROLLBACK, "期望 ROLLBACK");
+    // 可选 TRANSACTION / WORK
+    if (match(TokenType::TRANSACTION)) {}
+    else if (check(TokenType::IDENTIFIER)) {
+        auto up = peek().text;
+        for (auto& c : up) c = toupper(c);
+        if (up == "WORK" || up == "TRANSACTION") advance();
+    }
+    // 可选 TO [SAVEPOINT] savepoint_name (Phase 2)
+
+    Statement s;
+    s.type = StatementType::ROLLBACK_TRANSACTION;
     return s;
 }
 

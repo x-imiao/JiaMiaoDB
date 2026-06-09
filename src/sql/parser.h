@@ -43,6 +43,9 @@ private:
     Statement parse_create_table();
     Statement parse_drop_table();
     Statement parse_create_index();
+    Statement parse_begin();
+    Statement parse_commit();
+    Statement parse_rollback();
 
     // 表达式
     ExprPtr parse_expression();

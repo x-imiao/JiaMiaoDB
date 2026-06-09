@@ -237,6 +237,39 @@ std::string JiamiaoDBServer::process_query(const std::string& input) {
 
                     intent.description = "SQL: " + input;
 
+                    // 事务控制语句
+                    if (intent.statement.type == StatementType::BEGIN_TRANSACTION) {
+                        storage_->txn_mgr().begin_transaction_block();
+                        json r;
+                        r["type"] = "txn_result";
+                        r["message"] = "BEGIN";
+                        results_arr.push_back(r);
+                        continue;
+                    }
+                    if (intent.statement.type == StatementType::COMMIT_TRANSACTION) {
+                        auto xid = storage_->txn_mgr().get_current_xid();
+                        if (xid != 0) storage_->write_xact_commit(xid);
+                        storage_->txn_mgr().commit_transaction();
+                        storage_->txn_mgr().reset_context();
+                        json r;
+                        r["type"] = "txn_result";
+                        r["message"] = "COMMIT";
+                        results_arr.push_back(r);
+                        continue;
+                    }
+                    if (intent.statement.type == StatementType::ROLLBACK_TRANSACTION) {
+                        auto xid = storage_->txn_mgr().get_current_xid();
+                        if (xid != 0) storage_->write_xact_abort(xid);
+                        storage_->apply_undo();
+                        storage_->txn_mgr().abort_transaction();
+                        storage_->txn_mgr().reset_context();
+                        json r;
+                        r["type"] = "txn_result";
+                        r["message"] = "ROLLBACK";
+                        results_arr.push_back(r);
+                        continue;
+                    }
+
                     // 如果 DDL，直接通过 storage 执行
                     if (intent.statement.type == StatementType::CREATE_TABLE && intent.statement.create_table) {
                         storage_->create_table(intent.statement.create_table->name,
@@ -257,8 +290,13 @@ std::string JiamiaoDBServer::process_query(const std::string& input) {
                         continue;
                     }
 
+                    // 隐式事务包装
+                    storage_->txn_mgr().start_transaction_command();
+
                     // 通过 AI Executor 执行
                     auto exec_result = executor_->execute(std::move(intent));
+
+                    storage_->txn_mgr().commit_transaction_command();
 
                     for (const auto& rs : exec_result.results) {
                         json r;
@@ -313,7 +351,9 @@ std::string JiamiaoDBServer::process_query(const std::string& input) {
                     response["type"] = "conversation";
                     response["reply"] = nl_result.reply;
                 } else if (nl_result.success) {
+                    storage_->txn_mgr().start_transaction_command();
                     auto exec_result = executor_->execute(std::move(nl_result.intent));
+                    storage_->txn_mgr().commit_transaction_command();
                     json results_arr = json::array();
                     for (const auto& rs : exec_result.results) {
                         json r;
@@ -397,5 +437,5 @@ bool JiamiaoDBServer::is_likely_sql(const std::string& input) {
     return starts_with("SELECT") || starts_with("INSERT") || starts_with("UPDATE") ||
            starts_with("DELETE") || starts_with("CREATE") || starts_with("DROP") ||
            starts_with("ALTER") || starts_with("SHOW") || starts_with("BEGIN") ||
-           starts_with("COMMIT") || starts_with("TRUNCATE");
+           starts_with("COMMIT") || starts_with("ROLLBACK") || starts_with("TRUNCATE");
 }
