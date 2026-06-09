@@ -58,14 +58,21 @@ ResultSet PipelineExecutor::execute_pipeline(const Pipeline& pipeline) {
     // 数据流
     RowSet rows;
 
+    // Read Committed: 每条 SQL 语句获取新快照
+    auto& txn = storage_->txn_mgr();
+    auto snap = txn.get_snapshot();
+    auto xid = txn.get_current_xid();
+    auto cid = txn.get_current_command_id();
+
     for (const auto& op : pipeline) {
         switch (op.type) {
             case PipelineOpType::SCAN: {
-                rows = storage_->scan(op.table);
+                rows = storage_->scan_with_snapshot(op.table, snap, xid, cid);
                 break;
             }
             case PipelineOpType::INDEX_SCAN: {
-                rows = storage_->index_lookup(op.table, op.column, op.index_value);
+                rows = storage_->index_lookup_with_snapshot(
+                    op.table, op.column, op.index_value, snap, xid, cid);
                 break;
             }
             case PipelineOpType::FILTER: {

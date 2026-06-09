@@ -122,6 +122,16 @@ private:
     std::set<TransactionId> dirty_;  // 自上次 checkpoint 以来改变过的 xid
 };
 
+// ── Tuple Visibility (MVCC) ─────────────────────────────
+
+// Read Committed 行可见性判断。
+// current_xid: 当前事务 XID (InvalidTransactionId = 无事务)
+// snap: 语句开始时获取的快照
+// cur_cid: 当前命令 ID (事务内可见性)
+bool check_tuple_visibility(const Row& row, TransactionId current_xid,
+                            const Snapshot& snap, int32_t cur_cid,
+                            const CLog& clog);
+
 // ── TransactionContext ──────────────────────────────────
 
 struct TransactionContext {

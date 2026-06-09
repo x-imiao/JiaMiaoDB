@@ -59,6 +59,13 @@ public:
     bool has_index(const std::string& table, const std::string& column);
     void create_index(const std::string& table, const std::string& column);
 
+    // MVCC 可见性感知的扫描
+    RowSet scan_with_snapshot(const std::string& table, const jiamiao::Snapshot& snap,
+                              jiamiao::TransactionId xid, int32_t cid);
+    RowSet index_lookup_with_snapshot(const std::string& table, const std::string& column,
+                                      const Value& value, const jiamiao::Snapshot& snap,
+                                      jiamiao::TransactionId xid, int32_t cid);
+
     // 事务 WAL 与 Undo
     void apply_undo();
     void write_xact_commit(jiamiao::TransactionId xid);

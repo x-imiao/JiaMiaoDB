@@ -183,6 +183,8 @@ Row StorageEngine::insert(const std::string& table, const Row& row) {
     int64_t id = (row_ids_[table]) + 1;
     row_ids_[table] = id;
     validated["_rowid"] = id;
+    validated["_xmax"] = static_cast<int64_t>(0);
+    validated["_cid"]  = static_cast<int64_t>(0);
 
     json row_json;
     for (const auto& [k, v] : validated) {
@@ -216,6 +218,24 @@ RowSet StorageEngine::scan(const std::string& table) {
         throw std::runtime_error("表 \"" + table + "\" 不存在");
     }
     return it->second;
+}
+
+RowSet StorageEngine::scan_with_snapshot(const std::string& table,
+                                          const jiamiao::Snapshot& snap,
+                                          jiamiao::TransactionId xid,
+                                          int32_t cid) {
+    std::lock_guard<std::mutex> lock(global_mutex_);
+    auto it = data_.find(table);
+    if (it == data_.end()) {
+        throw std::runtime_error("表 \"" + table + "\" 不存在");
+    }
+    RowSet visible;
+    for (const auto& row : it->second) {
+        if (jiamiao::check_tuple_visibility(row, xid, snap, cid, txn_mgr_->clog())) {
+            visible.push_back(row);
+        }
+    }
+    return visible;
 }
 
 int64_t StorageEngine::update(const std::string& table, std::function<bool(const Row&)> match,
@@ -320,6 +340,27 @@ Row StorageEngine::insert_with_txn(const std::string& table, const Row& row) {
     // 分配 XID (首次写触发)
     jiamiao::TransactionId xid = txn_mgr_->assign_xid();
     validated["_xmin"] = static_cast<int64_t>(xid);
+    validated["_xmax"] = static_cast<int64_t>(0);  // 未删除
+    validated["_cid"]  = static_cast<int64_t>(txn_mgr_->get_current_command_id());
+
+    // PRIMARY KEY 唯一性检查
+    {
+        auto snap = txn_mgr_->get_snapshot();
+        auto cid = txn_mgr_->get_current_command_id();
+        for (const auto& col : schema_it->second.columns) {
+            if (!col.primary_key) continue;
+            auto pk_it = validated.find(col.name);
+            if (pk_it == validated.end()) continue;
+            for (const auto& existing : data_[table]) {
+                if (!jiamiao::check_tuple_visibility(existing, xid, snap, cid, txn_mgr_->clog()))
+                    continue;
+                auto ev = existing.find(col.name);
+                if (ev != existing.end() && ev->second == pk_it->second) {
+                    throw std::runtime_error("重复键值违反唯一约束 \"" + col.name + "\"");
+                }
+            }
+        }
+    }
 
     // 注册 Undo 记录
     txn_mgr_->add_undo_record(jiamiao::UndoRecord(
@@ -360,25 +401,65 @@ int64_t StorageEngine::update_with_txn(const std::string& table,
     }
 
     jiamiao::TransactionId xid = txn_mgr_->assign_xid();
+    auto snap = txn_mgr_->get_snapshot();
+    int32_t cid = txn_mgr_->get_current_command_id();
     bool index_affected = updates_affect_index(table, updates);
     int64_t count = 0;
+    std::vector<Row> new_versions;
 
     for (auto& row : rows_it->second) {
+        // 可见性检查: 只更新可见的行
+        if (!jiamiao::check_tuple_visibility(row, xid, snap, cid, txn_mgr_->clog()))
+            continue;
+
         if (match(row)) {
-            // 保存旧行用于 Undo
+            // 保存修改前的行 (用于 Undo, 此时 _xmax 还是旧值)
             Row old_row = row;
             int64_t rowid = std::get<int64_t>(row.at("_rowid"));
 
-            // 注册 Undo
+            // 1. 标记旧版本的 _xmax
+            row["_xmax"] = static_cast<int64_t>(xid);
+            row["_cid"]  = static_cast<int64_t>(cid);
+
+            // 2. 创建新行版本 (包含 _xmax 标记后的行数据作为基础)
             Row new_row = row;
             for (const auto& [k, v] : updates) {
                 new_row[k] = v;
             }
+            // 覆盖系统列为新版本的值
             new_row["_xmin"] = static_cast<int64_t>(xid);
+            new_row["_xmax"] = static_cast<int64_t>(0);
+            new_row["_cid"]  = static_cast<int64_t>(cid);
+
+            // PK 唯一性检查 (如果更新了 PK 列)
+            {
+                auto schema_it = tables_.find(table);
+                if (schema_it != tables_.end()) {
+                    for (const auto& col : schema_it->second.columns) {
+                        if (!col.primary_key) continue;
+                        auto up_it = updates.find(col.name);
+                        if (up_it == updates.end()) continue; // 未修改此 PK 列
+                        for (const auto& existing : rows_it->second) {
+                            if (!jiamiao::check_tuple_visibility(existing, xid, snap, cid, txn_mgr_->clog()))
+                                continue;
+                            // 排除正在更新的行自身 (通过 _rowid)
+                            auto er = existing.find("_rowid");
+                            if (er != existing.end() && std::get<int64_t>(er->second) == rowid)
+                                continue;
+                            auto ev = existing.find(col.name);
+                            if (ev != existing.end() && ev->second == up_it->second) {
+                                throw std::runtime_error("重复键值违反唯一约束 \"" + col.name + "\"");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. 注册 Undo
             txn_mgr_->add_undo_record(jiamiao::UndoRecord(
                 jiamiao::UndoOp::UPDATE, table, rowid, old_row, new_row));
 
-            // WAL
+            // 4. WAL
             json upd_json;
             for (const auto& [k, v] : updates) {
                 std::visit([&](auto&& val) {
@@ -390,18 +471,34 @@ int64_t StorageEngine::update_with_txn(const std::string& table,
                     else if constexpr (std::is_same_v<T, std::string>) upd_json[k] = val;
                 }, v);
             }
+
+            // 序列化新行
+            json new_row_json;
+            for (const auto& [k, v] : new_row) {
+                std::visit([&](auto&& val) {
+                    using T = std::decay_t<decltype(val)>;
+                    if constexpr (std::is_same_v<T, std::nullptr_t>) new_row_json[k] = nullptr;
+                    else if constexpr (std::is_same_v<T, int64_t>) new_row_json[k] = val;
+                    else if constexpr (std::is_same_v<T, double>) new_row_json[k] = val;
+                    else if constexpr (std::is_same_v<T, bool>) new_row_json[k] = val;
+                    else if constexpr (std::is_same_v<T, std::string>) new_row_json[k] = val;
+                }, v);
+            }
+
             json data;
             data["rowid"] = rowid;
             data["updates"] = upd_json;
+            data["new_row"] = new_row_json;
             write_wal("update", table, data, xid);
 
-            // 应用更新
-            for (const auto& [k, v] : updates) {
-                row[k] = v;
-            }
-            row["_xmin"] = static_cast<int64_t>(xid);
+            new_versions.push_back(std::move(new_row));
             count++;
         }
+    }
+
+    // 追加所有新版本
+    for (auto& r : new_versions) {
+        data_[table].push_back(std::move(r));
     }
 
     if (index_affected) rebuild_indexes(table);
@@ -418,48 +515,47 @@ int64_t StorageEngine::remove_with_txn(const std::string& table,
     }
 
     jiamiao::TransactionId xid = txn_mgr_->assign_xid();
+    auto snap = txn_mgr_->get_snapshot();
+    int32_t cid = txn_mgr_->get_current_command_id();
     auto& rows = rows_it->second;
-    std::vector<int64_t> to_delete;
+    int64_t count = 0;
 
     for (size_t i = 0; i < rows.size(); i++) {
+        // 可见性检查: 只删除可见的行
+        if (!jiamiao::check_tuple_visibility(rows[i], xid, snap, cid, txn_mgr_->clog()))
+            continue;
+
         if (match(rows[i])) {
             int64_t rowid = std::get<int64_t>(rows[i].at("_rowid"));
 
-            // 注册 Undo
+            // 保存修改前的行 (用于 Undo)
+            Row old_row = rows[i];
+
+            // 标记 _xmax (MVCC 删除)
+            rows[i]["_xmax"] = static_cast<int64_t>(xid);
+            rows[i]["_cid"]  = static_cast<int64_t>(cid);
+
+            // 注册 Undo (old_row 保留了修改前的 _xmax / _cid)
             txn_mgr_->add_undo_record(jiamiao::UndoRecord(
-                jiamiao::UndoOp::DELETE, table, rowid, rows[i], {}));
+                jiamiao::UndoOp::DELETE, table, rowid, old_row, {}));
 
             // WAL
             json data;
             data["rowid"] = rowid;
+            data["xmax"]  = static_cast<int64_t>(xid);
             write_wal("delete", table, data, xid);
 
-            to_delete.push_back(i);
+            count++;
         }
-    }
-
-    // 从后往前删除
-    RowSet kept;
-    for (size_t i = 0; i < rows.size(); i++) {
-        if (std::find(to_delete.begin(), to_delete.end(), (int64_t)i) == to_delete.end()) {
-            kept.push_back(std::move(rows[i]));
-        }
-    }
-
-    data_[table] = std::move(kept);
-    rebuild_indexes(table);
-
-    auto schema_it = tables_.find(table);
-    if (schema_it != tables_.end()) {
-        schema_it->second.row_count = data_[table].size();
     }
 
     maybe_checkpoint();
-    return to_delete.size();
+    return count;
 }
 
 void StorageEngine::apply_undo() {
     const auto& records = txn_mgr_->undo_records();
+    jiamiao::TransactionId our_xid = txn_mgr_->get_current_xid();
 
     // 反向遍历 undo records (后进先出)
     for (auto it = records.rbegin(); it != records.rend(); ++it) {
@@ -470,10 +566,13 @@ void StorageEngine::apply_undo() {
 
         switch (rec.op) {
         case jiamiao::UndoOp::INSERT:
-            // 回滚 INSERT = 删除插入的行
+            // 回滚 INSERT = 删除由我们插入的行 (匹配 _rowid + _xmin)
             for (size_t i = 0; i < rows.size(); i++) {
                 auto rit = rows[i].find("_rowid");
-                if (rit != rows[i].end() && std::get<int64_t>(rit->second) == rec.row_id) {
+                auto xit = rows[i].find("_xmin");
+                if (rit != rows[i].end() && xit != rows[i].end() &&
+                    std::get<int64_t>(rit->second) == rec.row_id &&
+                    std::get<int64_t>(xit->second) == static_cast<int64_t>(our_xid)) {
                     rows.erase(rows.begin() + i);
                     break;
                 }
@@ -481,20 +580,51 @@ void StorageEngine::apply_undo() {
             break;
 
         case jiamiao::UndoOp::UPDATE:
-            // 回滚 UPDATE = 恢复旧行
+            // 回滚 UPDATE:
+            // 1. 删除我们创建的新行版本 (匹配 _rowid + _xmin == our_xid)
             for (size_t i = 0; i < rows.size(); i++) {
                 auto rit = rows[i].find("_rowid");
-                if (rit != rows[i].end() && std::get<int64_t>(rit->second) == rec.row_id) {
-                    rows[i] = rec.old_row;  // 恢复旧行（含原始 _xmin）
-                    rows[i]["_rowid"] = rec.row_id;
+                auto xit = rows[i].find("_xmin");
+                if (rit != rows[i].end() && xit != rows[i].end() &&
+                    std::get<int64_t>(rit->second) == rec.row_id &&
+                    std::get<int64_t>(xit->second) == static_cast<int64_t>(our_xid)) {
+                    rows.erase(rows.begin() + i);
+                    break;
+                }
+            }
+            // 2. 恢复旧版本的 _xmax 和 _cid (匹配 _rowid + _xmax == our_xid)
+            for (size_t i = 0; i < rows.size(); i++) {
+                auto rit = rows[i].find("_rowid");
+                auto xit = rows[i].find("_xmax");
+                if (rit != rows[i].end() && xit != rows[i].end() &&
+                    std::get<int64_t>(rit->second) == rec.row_id &&
+                    std::get<int64_t>(xit->second) == static_cast<int64_t>(our_xid)) {
+                    // 从 old_row 恢复
+                    auto ox = rec.old_row.find("_xmax");
+                    if (ox != rec.old_row.end()) rows[i]["_xmax"] = ox->second;
+                    auto oc = rec.old_row.find("_cid");
+                    if (oc != rec.old_row.end()) rows[i]["_cid"] = oc->second;
                     break;
                 }
             }
             break;
 
         case jiamiao::UndoOp::DELETE:
-            // 回滚 DELETE = 重新插入旧行
-            rows.push_back(rec.old_row);
+            // 回滚 DELETE = 清除 _xmax (匹配 _rowid + _xmax == our_xid)
+            for (size_t i = 0; i < rows.size(); i++) {
+                auto rit = rows[i].find("_rowid");
+                auto xit = rows[i].find("_xmax");
+                if (rit != rows[i].end() && xit != rows[i].end() &&
+                    std::get<int64_t>(rit->second) == rec.row_id &&
+                    std::get<int64_t>(xit->second) == static_cast<int64_t>(our_xid)) {
+                    // 从 old_row 恢复 _xmax 和 _cid
+                    auto ox = rec.old_row.find("_xmax");
+                    if (ox != rec.old_row.end()) rows[i]["_xmax"] = ox->second;
+                    auto oc = rec.old_row.find("_cid");
+                    if (oc != rec.old_row.end()) rows[i]["_cid"] = oc->second;
+                    break;
+                }
+            }
             break;
         }
     }
@@ -537,6 +667,37 @@ RowSet StorageEngine::index_lookup(const std::string& table, const std::string& 
             for (int64_t i : entry_it->second) {
                 if (i >= 0 && i < (int64_t)rows.size()) {
                     result.push_back(rows[i]);
+                }
+            }
+            return result;
+        }
+    }
+    return {};
+}
+
+RowSet StorageEngine::index_lookup_with_snapshot(const std::string& table,
+                                                   const std::string& column,
+                                                   const Value& value,
+                                                   const jiamiao::Snapshot& snap,
+                                                   jiamiao::TransactionId xid,
+                                                   int32_t cid) {
+    std::lock_guard<std::mutex> lock(global_mutex_);
+    auto idx_it = indexes_.find(table);
+    if (idx_it == indexes_.end()) return {};
+
+    std::string key = value_to_string(value);
+    for (const auto& idx : idx_it->second) {
+        if (idx.column == column) {
+            auto entry_it = idx.entries.find(key);
+            if (entry_it == idx.entries.end()) return {};
+
+            RowSet result;
+            auto& rows = data_[table];
+            for (int64_t i : entry_it->second) {
+                if (i >= 0 && i < (int64_t)rows.size()) {
+                    if (jiamiao::check_tuple_visibility(rows[i], xid, snap, cid, txn_mgr_->clog())) {
+                        result.push_back(rows[i]);
+                    }
                 }
             }
             return result;
@@ -673,28 +834,63 @@ void StorageEngine::replay_record(const WALRecord& rec) {
         if (rows_it == data_.end()) return;
 
         int64_t rowid = rec.data["rowid"].get_int();
-        std::map<std::string, Value> updates;
-        for (auto it = rec.data["updates"].obj_begin(); it != rec.data["updates"].obj_end(); ++it) {
-            const auto& v = it->second;
-            if (v.is_null()) updates[it->first] = nullptr;
-            else if (v.is_int()) updates[it->first] = v.get_int();
-            else if (v.is_float()) updates[it->first] = v.get_float();
-            else if (v.is_bool()) updates[it->first] = v.get_bool();
-            else updates[it->first] = v.get_string();
-        }
+        jiamiao::TransactionId xid = rec.data.contains("_xid")
+            ? static_cast<jiamiao::TransactionId>(rec.data["_xid"].get_int())
+            : jiamiao::InvalidTransactionId;
 
-        bool index_affected = updates_affect_index(rec.table, updates);
+        // MVCC: 找到当前可见版本 (_rowid 匹配且 _xmax == 0), 标记 _xmax
         for (auto& row : rows_it->second) {
-            auto it = row.find("_rowid");
-            if (it != row.end() && std::get<int64_t>(it->second) == rowid) {
-                for (const auto& [k, v] : updates) {
-                    row[k] = v;
+            auto rit = row.find("_rowid");
+            auto xmax_it = row.find("_xmax");
+            if (rit != row.end() && std::get<int64_t>(rit->second) == rowid) {
+                int64_t cur_xmax = 0;
+                if (xmax_it != row.end()) cur_xmax = std::get<int64_t>(xmax_it->second);
+                if (cur_xmax == 0) {
+                    row["_xmax"] = static_cast<int64_t>(xid);
+                    break;
                 }
-                break;
             }
         }
 
-        if (index_affected) rebuild_indexes(rec.table);
+        // 从 WAL 恢复新行版本
+        if (rec.data.contains("new_row")) {
+            Row new_row;
+            for (auto it = rec.data["new_row"].obj_begin();
+                 it != rec.data["new_row"].obj_end(); ++it) {
+                const auto& v = it->second;
+                if (v.is_null()) new_row[it->first] = nullptr;
+                else if (v.is_int()) new_row[it->first] = v.get_int();
+                else if (v.is_float()) new_row[it->first] = v.get_float();
+                else if (v.is_bool()) new_row[it->first] = v.get_bool();
+                else new_row[it->first] = v.get_string();
+            }
+            rows_it->second.push_back(std::move(new_row));
+        } else {
+            // 兼容旧格式 (无 new_row): 原地更新
+            std::map<std::string, Value> updates;
+            for (auto it = rec.data["updates"].obj_begin();
+                 it != rec.data["updates"].obj_end(); ++it) {
+                const auto& v = it->second;
+                if (v.is_null()) updates[it->first] = nullptr;
+                else if (v.is_int()) updates[it->first] = v.get_int();
+                else if (v.is_float()) updates[it->first] = v.get_float();
+                else if (v.is_bool()) updates[it->first] = v.get_bool();
+                else updates[it->first] = v.get_string();
+            }
+            bool index_affected = updates_affect_index(rec.table, updates);
+            for (auto& row : rows_it->second) {
+                auto it = row.find("_rowid");
+                if (it != row.end() && std::get<int64_t>(it->second) == rowid) {
+                    for (const auto& [k, v] : updates) row[k] = v;
+                    break;
+                }
+            }
+            if (index_affected) rebuild_indexes(rec.table);
+        }
+
+        rebuild_indexes(rec.table);
+        auto schema_it = tables_.find(rec.table);
+        if (schema_it != tables_.end()) schema_it->second.row_count = rows_it->second.size();
         return;
     }
 
@@ -711,15 +907,36 @@ void StorageEngine::replay_record(const WALRecord& rec) {
         if (rows_it == data_.end()) return;
 
         int64_t rowid = rec.data["rowid"].get_int();
+        jiamiao::TransactionId xmax_val = rec.data.contains("xmax")
+            ? static_cast<jiamiao::TransactionId>(rec.data["xmax"].get_int())
+            : jiamiao::InvalidTransactionId;
+
         auto& rows = rows_it->second;
-        for (size_t i = 0; i < rows.size(); i++) {
-            auto it = rows[i].find("_rowid");
-            if (it != rows[i].end() && std::get<int64_t>(it->second) == rowid) {
-                rows.erase(rows.begin() + i);
-                rebuild_indexes(rec.table);
-                auto schema_it = tables_.find(rec.table);
-                if (schema_it != tables_.end()) schema_it->second.row_count = rows.size();
-                break;
+        if (xmax_val != jiamiao::InvalidTransactionId) {
+            // MVCC 格式: 标记 _xmax
+            for (size_t i = 0; i < rows.size(); i++) {
+                auto it = rows[i].find("_rowid");
+                auto xmax_it = rows[i].find("_xmax");
+                if (it != rows[i].end() && std::get<int64_t>(it->second) == rowid) {
+                    int64_t cur_xmax = 0;
+                    if (xmax_it != rows[i].end()) cur_xmax = std::get<int64_t>(xmax_it->second);
+                    if (cur_xmax == 0) {
+                        rows[i]["_xmax"] = static_cast<int64_t>(xmax_val);
+                    }
+                    break;
+                }
+            }
+        } else {
+            // 兼容旧格式: 物理删除
+            for (size_t i = 0; i < rows.size(); i++) {
+                auto it = rows[i].find("_rowid");
+                if (it != rows[i].end() && std::get<int64_t>(it->second) == rowid) {
+                    rows.erase(rows.begin() + i);
+                    rebuild_indexes(rec.table);
+                    auto schema_it = tables_.find(rec.table);
+                    if (schema_it != tables_.end()) schema_it->second.row_count = rows.size();
+                    break;
+                }
             }
         }
         return;

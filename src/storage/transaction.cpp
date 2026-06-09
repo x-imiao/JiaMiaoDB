@@ -8,6 +8,73 @@ using json = Json;
 namespace jiamiao {
 
 // ═══════════════════════════════════════════════════════════
+//  Tuple Visibility (MVCC)
+// ═══════════════════════════════════════════════════════════
+
+bool check_tuple_visibility(const Row& row, TransactionId current_xid,
+                            const Snapshot& snap, int32_t cur_cid,
+                            const CLog& clog) {
+    // 读取 _xmin（插入该行的事务ID）
+    TransactionId xmin = InvalidTransactionId;
+    auto xmin_it = row.find("_xmin");
+    if (xmin_it != row.end()) {
+        auto* v = std::get_if<int64_t>(&xmin_it->second);
+        if (v && *v > 0) xmin = static_cast<TransactionId>(*v);
+    }
+    // 没有 _xmin 的行（非事务写入的旧数据）视为可见
+    if (xmin == InvalidTransactionId) return true;
+
+    // 读取 _xmax（删除该行的事务ID，0 = 未删除）
+    TransactionId xmax = InvalidTransactionId;
+    auto xmax_it = row.find("_xmax");
+    if (xmax_it != row.end()) {
+        auto* v = std::get_if<int64_t>(&xmax_it->second);
+        if (v && *v > 0) xmax = static_cast<TransactionId>(*v);
+    }
+
+    // ── 规则 1: 自己插入的行 ──
+    if (xmin == current_xid && current_xid != InvalidTransactionId) {
+        // 检查命令 ID: 只能看到当前命令及之前插入的行
+        auto cid_it = row.find("_cid");
+        if (cid_it != row.end()) {
+            auto* cv = std::get_if<int64_t>(&cid_it->second);
+            if (cv && static_cast<int32_t>(*cv) > cur_cid) return false;
+        }
+        // 自己删除的 → 不可见
+        if (xmax == current_xid) return false;
+        return true;
+    }
+
+    // ── 规则 2: 插入者已回滚 → 不可见 ──
+    TransactionStatus xmin_status = clog.get_status(xmin);
+    if (xmin_status == TransactionStatus::ABORTED) return false;
+
+    // ── 规则 3: 插入者仍在进行中（非自己） → 不可见 ──
+    if (xmin_status == TransactionStatus::IN_PROGRESS) return false;
+
+    // ── 规则 4: 快照时插入者仍在活跃 → 不可见 ──
+    // xmin 已 COMMITTED，但需检查在快照时刻它是否活跃
+    if (xmin >= snap.xmin && xmin < snap.xmax) {
+        for (auto xip_xid : snap.xip) {
+            if (xip_xid == xmin) return false; // 快照时活跃
+        }
+    }
+
+    // ── 规则 5: 未删除 → 可见 ──
+    if (xmax == InvalidTransactionId) return true;
+
+    // ── 规则 6: 自己删除的 → 不可见 ──
+    if (xmax == current_xid && current_xid != InvalidTransactionId) return false;
+
+    // ── 规则 7: 删除者已提交 → 不可见 ──
+    TransactionStatus xmax_status = clog.get_status(xmax);
+    if (xmax_status == TransactionStatus::COMMITTED) return false;
+
+    // ── 规则 8: 删除者已回滚或进行中 → 可见 ──
+    return true;
+}
+
+// ═══════════════════════════════════════════════════════════
 //  CLog
 // ═══════════════════════════════════════════════════════════
 
