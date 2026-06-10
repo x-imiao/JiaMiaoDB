@@ -35,12 +35,13 @@ TEST_CASE("CLog: unknown XID returns IN_PROGRESS") {
     CHECK(clog.get_status(0) == jm::TransactionStatus::IN_PROGRESS);
 }
 
-TEST_CASE("CLog: IN_PROGRESS is not serialized in to_json") {
+TEST_CASE("CLog: IN_PROGRESS is serialized in to_json (for crash recovery)") {
     jm::CLog clog;
     clog.set_status(3, jm::TransactionStatus::IN_PROGRESS);
 
     json j = clog.to_json();
-    CHECK(j.size() == 0);  // IN_PROGRESS entries are excluded
+    // Phase 2 变更: IN_PROGRESS 也需要持久化, 用于崩溃恢复时被标记为 ABORTED
+    CHECK(j.size() == 1);
 }
 
 TEST_CASE("CLog: COMMITTED and ABORTED are serialized in to_json") {

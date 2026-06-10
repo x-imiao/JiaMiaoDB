@@ -64,9 +64,15 @@ ResultSet PipelineExecutor::execute_pipeline(const Pipeline& pipeline) {
     // 数据流
     RowSet rows;
 
-    // Read Committed: 每条 SQL 语句获取新快照
+    // 快照: RR/SI 在事务内复用同一快照, RC 每次取新快照
     auto& txn = storage_->txn_mgr();
-    auto snap = txn.get_snapshot();
+    auto iso = txn.get_isolation_level();
+    jiamiao::Snapshot snap;
+    if (iso == jiamiao::IsolationLevel::ReadCommitted || !txn.is_in_transaction()) {
+        snap = txn.get_snapshot();
+    } else {
+        snap = txn.get_transaction_snapshot();
+    }
     auto xid = txn.get_current_xid();
     auto cid = txn.get_current_command_id();
 

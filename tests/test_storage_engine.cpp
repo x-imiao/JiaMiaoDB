@@ -458,3 +458,301 @@ TEST_CASE("StorageEngine: concurrent operations on different tables") {
     CHECK(engine.scan("t_a").size() == 200);
     CHECK(engine.scan("t_b").size() == 200);
 }
+
+// ──── Savepoint 集成测试 ─────────────────────────────────
+
+TEST_CASE("StorageEngine: ROLLBACK TO SAVEPOINT undoes only post-savepoint writes") {
+    TempDir tmp;
+    StorageEngine engine(tmp.path, 10000);
+    engine.create_table("t", simple_schema());
+
+    // 启动事务, 插入 1 行
+    begin_txn(engine);
+    engine.insert_with_txn("t", make_data_row(1, "before"));
+    auto& txn = engine.txn_mgr();
+    auto our_xid = txn.get_current_xid();
+
+    // 创建 savepoint
+    txn.savepoint("sp1");
+    // 在 savepoint 之后又插入 2 行
+    engine.insert_with_txn("t", make_data_row(2, "after_a"));
+    engine.insert_with_txn("t", make_data_row(3, "after_b"));
+
+    auto snap = txn.get_snapshot();
+    auto rows = engine.scan_with_snapshot("t", snap, our_xid, 0);
+    REQUIRE(rows.size() == 3);
+
+    // 回滚到 sp1, 只应回滚后 2 行
+    size_t to_undo = txn.rollback_to_savepoint("sp1");
+    CHECK(to_undo == 2);
+    engine.apply_undo_to(to_undo);
+
+    auto snap2 = txn.get_snapshot();
+    auto rows2 = engine.scan_with_snapshot("t", snap2, our_xid, 0);
+    REQUIRE(rows2.size() == 1);
+    auto id_it = rows2[0].find("id");
+    REQUIRE(id_it != rows2[0].end());
+    auto* id_v = std::get_if<int64_t>(&id_it->second);
+    REQUIRE(id_v != nullptr);
+    CHECK(*id_v == 1);
+
+    engine.txn_mgr().abort_transaction();
+    engine.txn_mgr().reset_context();
+}
+
+TEST_CASE("StorageEngine: RELEASE SAVEPOINT keeps later writes") {
+    TempDir tmp;
+    StorageEngine engine(tmp.path, 10000);
+    engine.create_table("t", simple_schema());
+
+    begin_txn(engine);
+    engine.insert_with_txn("t", make_data_row(1, "kept"));
+    auto& txn = engine.txn_mgr();
+    auto our_xid = txn.get_current_xid();
+
+    txn.savepoint("sp1");
+    engine.insert_with_txn("t", make_data_row(2, "also_kept"));
+    txn.release_savepoint("sp1");
+
+    // 提交后, 2 行都应可见
+    commit_txn(engine);
+
+    auto snap = engine.txn_mgr().get_snapshot();
+    auto rows = engine.scan_with_snapshot("t", snap, jm::InvalidTransactionId, 0);
+    CHECK(rows.size() == 2);
+}
+
+// ──── Checkpoint 事务感知 ────────────────────────────────
+
+TEST_CASE("StorageEngine: checkpoint includes transaction state (CLog + next_xid)") {
+    TempDir tmp;
+    StorageEngine engine(tmp.path, 10000);
+    engine.create_table("t", simple_schema());
+
+    // 提交一些事务
+    begin_txn(engine);
+    engine.insert_with_txn("t", make_data_row(1, "a"));
+    commit_txn(engine);
+
+    begin_txn(engine);
+    engine.insert_with_txn("t", make_data_row(2, "b"));
+    commit_txn(engine);
+
+    auto next_xid_before = engine.txn_mgr().get_next_xid();
+    engine.save();
+
+    // 创建新 engine, 验证 next_xid 被恢复
+    StorageEngine engine2(tmp.path, 10000);
+    engine2.load();
+    CHECK(engine2.txn_mgr().get_next_xid() == next_xid_before);
+
+    // 验证数据被恢复
+    auto rows = engine2.scan("t");
+    CHECK(rows.size() == 2);
+}
+
+TEST_CASE("StorageEngine: checkpoint mid-transaction preserves active xid correctly") {
+    TempDir tmp;
+    StorageEngine engine(tmp.path, 10000);
+    engine.create_table("t", simple_schema());
+
+    // 启动事务, 但不提交
+    begin_txn(engine);
+    engine.insert_with_txn("t", make_data_row(1, "uncommitted"));
+    auto our_xid = engine.txn_mgr().get_current_xid();
+    // 不 commit, 不 reset
+
+    // checkpoint
+    engine.save();
+
+    // 重新加载 — IN_PROGRESS xid 应被 rebuild_active_from_clog 标记为 ABORTED
+    StorageEngine engine2(tmp.path, 10000);
+    engine2.load();
+    CHECK(engine2.txn_mgr().clog().get_status(our_xid) == jm::TransactionStatus::ABORTED);
+
+    // 用 scan_with_snapshot (visibility check) 验证行不可见
+    auto snap = engine2.txn_mgr().get_snapshot();
+    auto visible_rows = engine2.scan_with_snapshot("t", snap, jm::InvalidTransactionId, 0);
+    CHECK(visible_rows.empty());
+}
+
+TEST_CASE("StorageEngine: maybe_checkpoint fires after threshold writes") {
+    TempDir tmp;
+    // checkpoint_interval = 5
+    StorageEngine engine(tmp.path, 5);
+    engine.create_table("t", simple_schema());
+
+    // 写入 5 行 — 第 5 个写入后应触发 checkpoint
+    for (int i = 1; i <= 5; ++i) {
+        begin_txn(engine);
+        engine.insert_with_txn("t", make_data_row(i, "v"));
+        commit_txn(engine);
+    }
+
+    // 重新加载, 数据应被 checkpoint 保留
+    StorageEngine engine2(tmp.path, 5);
+    engine2.load();
+    CHECK(engine2.scan("t").size() == 5);
+}
+
+TEST_CASE("StorageEngine: recovery works correctly after WAL truncation") {
+    // 该测试覆盖 Phase 2: 写数据 → 触发 checkpoint → 截断 WAL → 重新加载
+    // 验证: 即使 WAL 已被截断, 数据仍可通过 checkpoint 恢复
+    // (WAL 截断逻辑本身在 test_wal.cpp 中以单元测试方式覆盖)
+    TempDir tmp;
+    StorageEngine engine(tmp.path, 100);
+    engine.create_table("t", simple_schema());
+    engine.load();
+
+    // 写 3 行并 commit
+    for (int i = 1; i <= 3; ++i) {
+        begin_txn(engine);
+        engine.insert_with_txn("t", make_data_row(i, "v"));
+        commit_txn(engine);
+    }
+
+    // close 触发 checkpoint (会 sync WAL) + WAL 截断
+    engine.close();
+
+    // 重新打开, 数据应完整 (从 checkpoint 恢复 + 可能重放 WAL 残留)
+    StorageEngine engine2(tmp.path, 100);
+    engine2.load();
+    CHECK(engine2.scan("t").size() == 3);
+}
+
+TEST_CASE("StorageEngine: vacuum physically removes dead rows from committed deletes") {
+    TempDir tmp;
+    StorageEngine engine(tmp.path, 10000);
+    engine.create_table("t", simple_schema());
+
+    // 插入并提交 2 行
+    begin_txn(engine);
+    engine.insert_with_txn("t", make_data_row(1, "a"));
+    commit_txn(engine);
+
+    begin_txn(engine);
+    engine.insert_with_txn("t", make_data_row(2, "b"));
+    commit_txn(engine);
+
+    // 删除并提交
+    begin_txn(engine);
+    engine.remove_with_txn("t", [](const Row& r) {
+        auto it = r.find("id");
+        if (it == r.end()) return false;
+        auto* v = std::get_if<int64_t>(&it->second);
+        return v && *v == 2;
+    });
+    commit_txn(engine);
+
+    // vacuum 前: 物理行有 2 (含 1 个被 _xmax 标记的)
+    REQUIRE(engine.scan("t").size() == 2);
+
+    // vacuum
+    int64_t cleaned = engine.vacuum();
+    CHECK(cleaned == 1);  // 删除 1 个被标记的行
+
+    // vacuum 后: 物理行 1
+    CHECK(engine.scan("t").size() == 1);
+
+    // 数据仍然正确
+    auto snap = engine.txn_mgr().get_snapshot();
+    auto rows = engine.scan_with_snapshot("t", snap, jm::InvalidTransactionId, 0);
+    REQUIRE(rows.size() == 1);
+    auto id_it = rows[0].find("id");
+    REQUIRE(id_it != rows[0].end());
+    auto* id_v = std::get_if<int64_t>(&id_it->second);
+    REQUIRE(id_v != nullptr);
+    CHECK(*id_v == 1);
+}
+
+TEST_CASE("StorageEngine: vacuum freezes old committed rows (xmin -> FrozenXid)") {
+    TempDir tmp;
+    StorageEngine engine(tmp.path, 10000);
+    engine.create_table("t", simple_schema());
+
+    begin_txn(engine);
+    engine.insert_with_txn("t", make_data_row(1, "old"));
+    commit_txn(engine);
+
+    // vacuum: 冻结 _xmin (无活跃事务)
+    int64_t cleaned = engine.vacuum();
+    CHECK(cleaned == 0);  // 没有 dead rows, 但有冻结
+
+    // 检查行被冻结
+    auto rows = engine.scan("t");
+    REQUIRE(rows.size() == 1);
+    auto xmin_it = rows[0].find("_xmin");
+    REQUIRE(xmin_it != rows[0].end());
+    auto* v = std::get_if<int64_t>(&xmin_it->second);
+    REQUIRE(v != nullptr);
+    CHECK(*v == static_cast<int64_t>(jm::FrozenTransactionId));
+}
+
+TEST_CASE("StorageEngine: vacuum after abort-then-reinsert (only committed visible)") {
+    TempDir tmp;
+    StorageEngine engine(tmp.path, 10000);
+    engine.create_table("t", simple_schema());
+
+    // 插入并回滚 (apply_undo 会物理删除)
+    begin_txn(engine);
+    engine.insert_with_txn("t", make_data_row(1, "aborted"));
+    rollback_txn(engine);
+
+    // 插入并提交
+    begin_txn(engine);
+    engine.insert_with_txn("t", make_data_row(2, "committed"));
+    commit_txn(engine);
+
+    // 物理行: 1 (回滚的行已被 apply_undo 删除)
+    REQUIRE(engine.scan("t").size() == 1);
+
+    // vacuum: 应该清理 0 行 (没有 dead rows)
+    int64_t cleaned = engine.vacuum();
+    CHECK(cleaned == 0);
+    CHECK(engine.scan("t").size() == 1);
+}
+
+TEST_CASE("StorageEngine: vacuum on empty table is no-op") {
+    TempDir tmp;
+    StorageEngine engine(tmp.path, 10000);
+    engine.create_table("t", simple_schema());
+
+    int64_t cleaned = engine.vacuum();
+    CHECK(cleaned == 0);
+}
+
+TEST_CASE("StorageEngine: vacuum preserves indexes after cleanup") {
+    TempDir tmp;
+    StorageEngine engine(tmp.path, 10000);
+    engine.create_table("t", simple_schema());
+    engine.create_index("t", "name");
+
+    begin_txn(engine);
+    engine.insert_with_txn("t", make_data_row(1, "alice"));
+    commit_txn(engine);
+
+    begin_txn(engine);
+    engine.insert_with_txn("t", make_data_row(2, "bob"));
+    commit_txn(engine);
+
+    // 删除 alice
+    begin_txn(engine);
+    engine.remove_with_txn("t", [](const Row& r) {
+        auto it = r.find("id");
+        if (it == r.end()) return false;
+        auto* v = std::get_if<int64_t>(&it->second);
+        return v && *v == 1;
+    });
+    commit_txn(engine);
+
+    engine.vacuum();
+
+    // 数据应只剩 bob
+    REQUIRE(engine.scan("t").size() == 1);
+    auto rows = engine.scan("t");
+    auto name_it = rows[0].find("name");
+    REQUIRE(name_it != rows[0].end());
+    auto* name_v = std::get_if<std::string>(&name_it->second);
+    REQUIRE(name_v != nullptr);
+    CHECK(*name_v == "bob");
+}

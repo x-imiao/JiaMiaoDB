@@ -20,6 +20,9 @@ using json = Json;
    4. JSON Lines 格式，每行一条记录
    ═══════════════════════════════════════════════════════ */
 
+// WAL 记录格式版本: 后续如果格式变更, 可以区分旧/新格式
+constexpr int64_t WAL_FORMAT_VERSION = 2;
+
 struct WALRecord {
     int64_t seq;
     int64_t timestamp;
@@ -29,6 +32,7 @@ struct WALRecord {
 
     json to_json() const {
         json j;
+        j["v"] = WAL_FORMAT_VERSION;  // 格式版本
         j["seq"] = seq;
         j["ts"] = timestamp;
         j["op"] = op;
@@ -39,6 +43,7 @@ struct WALRecord {
 
     static WALRecord from_json(const json& j) {
         WALRecord rec;
+        // 旧格式 (v1) 没有 v 字段, 默认为 1
         rec.seq = j["seq"].get_int();
         rec.timestamp = j.value("ts", (int64_t)0);
         rec.op = j["op"].get_string();
@@ -57,6 +62,9 @@ public:
     void close();
     void append(const WALRecord& rec);
     void sync();
+    // 截断 WAL: 删除 seq <= cutoff_seq 的记录
+    // 由 checkpoint 在持久化完成后调用
+    void truncate(int64_t cutoff_seq);
 
     int64_t current_seq() const { return seq_; }
     void set_seq(int64_t seq) { seq_ = seq; }

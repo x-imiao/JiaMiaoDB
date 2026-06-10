@@ -32,6 +32,15 @@ bool check_tuple_visibility(const Row& row, TransactionId current_xid,
         if (v && *v > 0) xmax = static_cast<TransactionId>(*v);
     }
 
+    // 冻结事务: _xmin == FrozenTransactionId (2) 表示该行在远古历史中已存在,
+    // 永远可见 (除非被 _xmax 删除)
+    if (xmin == FrozenTransactionId) {
+        if (xmax == InvalidTransactionId) return true;
+        if (xmax == current_xid && current_xid != InvalidTransactionId) return false;
+        auto xmax_status = clog.get_status(xmax);
+        return xmax_status != TransactionStatus::COMMITTED;
+    }
+
     // ── 规则 1: 自己插入的行 ──
     if (xmin == current_xid && current_xid != InvalidTransactionId) {
         // 检查命令 ID: 只能看到当前命令及之前插入的行
@@ -95,14 +104,12 @@ Json CLog::to_json() const {
     std::lock_guard<std::mutex> lock(mutex_);
     json entries = json::array();
     for (const auto& [xid, status] : status_map_) {
-        // 只序列化已结束的事务 (COMMITTED / ABORTED)
-        // IN_PROGRESS 的事务不需要持久化 (崩溃后自然回滚)
-        if (status != TransactionStatus::IN_PROGRESS) {
-            json e;
-            e["xid"] = static_cast<int64_t>(xid);
-            e["status"] = static_cast<uint8_t>(status);
-            entries.push_back(e);
-        }
+        // 序列化所有条目: 已结束的用于恢复可见性判断,
+        // IN_PROGRESS 的用于崩溃恢复 (会被 rebuild_active_from_clog 标记为 ABORTED)
+        json e;
+        e["xid"] = static_cast<int64_t>(xid);
+        e["status"] = static_cast<uint8_t>(status);
+        entries.push_back(e);
     }
     return entries;
 }
@@ -149,6 +156,13 @@ TransactionManager::TransactionManager() {
 // ── XID 分配 ────────────────────────────────────────────
 
 TransactionId TransactionManager::allocate_xid() {
+    // 回卷保护: 先尝试冻结, 再检查是否还能分配
+    maybe_anti_wraparound();
+    uint64_t next = next_xid_.load();
+    if (next >= XIDEmergencyStop) {
+        throw std::runtime_error(
+            "XID 计数已达紧急停机点, 需执行全库 VACUUM (anti-wraparound)");
+    }
     TransactionId xid = next_xid_.fetch_add(1);
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -163,6 +177,53 @@ TransactionId TransactionManager::assign_xid() {
         context_.xid = allocate_xid();
     }
     return context_.xid;
+}
+
+// ── XID 回卷保护 ────────────────────────────────────────
+
+TransactionId TransactionManager::get_oldest_active_xid() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (active_xids_.empty()) return next_xid_.load();
+    return *active_xids_.begin();
+}
+
+int64_t TransactionManager::freeze_old_xids() {
+    // 冻结策略: 把所有非活跃且 < next_xid - threshold 的 CLog 条目清掉
+    // 活跃 xid 不会被冻结 (它们还在使用)
+    int64_t frozen = 0;
+    auto next = next_xid_.load();
+    auto oldest = get_oldest_active_xid();
+
+    // 遍历 CLog, 移除/标记可冻结的条目
+    auto all = clog_.all_xids();
+    for (auto xid : all) {
+        if (xid < FirstNormalTransactionId) continue;  // 跳过保留值
+        if (xid >= oldest) continue;  // 还在活跃窗口内
+        auto status = clog_.get_status(xid);
+        if (status == TransactionStatus::IN_PROGRESS) {
+            // 僵尸事务: 强制 abort
+            clog_.set_status(xid, TransactionStatus::ABORTED);
+            frozen++;
+        } else {
+            // COMMITTED / ABORTED: 已被快照记录, 可清掉 CLog 条目
+            // 这里只统计数量, 实际删除由 CLog 内部完成
+            frozen++;
+        }
+    }
+    return frozen;
+}
+
+bool TransactionManager::maybe_anti_wraparound() {
+    // next_xid 是单调计数器, FrozenTransactionId=2 是历史下限
+    // 当 next_xid - FrozenXid > XIDFreezeThreshold 时触发冻结
+    auto next = next_xid_.load();
+    if (next <= XIDFreezeThreshold) return false;
+    auto distance = next - FrozenTransactionId;
+    if (distance > XIDFreezeThreshold) {
+        freeze_old_xids();
+        return true;
+    }
+    return false;
 }
 
 // ── Snapshot ────────────────────────────────────────────
@@ -185,10 +246,128 @@ TransactionStatus TransactionManager::get_transaction_status(TransactionId xid) 
     return clog_.get_status(xid);
 }
 
+// ── Snapshot (事务级快照, RR/SI 使用) ─────────────────────
+
+Snapshot TransactionManager::get_transaction_snapshot() {
+    // RR / SI: 事务内共用一个快照, 取一次后整个事务复用
+    if (!context_.has_snapshot) {
+        context_.snapshot = get_snapshot();
+        context_.has_snapshot = true;
+    }
+    return context_.snapshot;
+}
+
+// ── SSI: SIREAD 注册与 rw-antidependency ─────────────────
+
+void TransactionManager::register_siread(const RowKey& row_key) {
+    // SIREAD 仅在 SERIALIZABLE 下生效
+    if (context_.isolation != IsolationLevel::Serializable) return;
+    if (context_.xid == InvalidTransactionId) return;
+
+    std::lock_guard<std::mutex> lock(ssi_mutex_);
+    siread_map_[row_key].insert(context_.xid);
+}
+
+void TransactionManager::register_write(const RowKey& row_key) {
+    // 仅 SERIALIZABLE 下需追踪 rw-antidependency
+    if (context_.isolation != IsolationLevel::Serializable) return;
+    if (context_.xid == InvalidTransactionId) return;
+
+    std::lock_guard<std::mutex> lock(ssi_mutex_);
+    auto it = siread_map_.find(row_key);
+    if (it == siread_map_.end()) return;
+
+    // 找出所有读过该行的其他活跃事务, 建立 rw 边
+    for (TransactionId reader : it->second) {
+        if (reader == context_.xid) continue;
+        in_conflict_[reader].insert(context_.xid);
+    }
+}
+
+void TransactionManager::cleanup_transaction_state(TransactionId xid) {
+    std::lock_guard<std::mutex> lock(ssi_mutex_);
+    // 从 SIREAD 集合移除 xid
+    for (auto& [key, readers] : siread_map_) {
+        readers.erase(xid);
+    }
+    // 清理空的 SIREAD 条目 (避免无限增长)
+    for (auto it = siread_map_.begin(); it != siread_map_.end(); ) {
+        if (it->second.empty()) it = siread_map_.erase(it);
+        else ++it;
+    }
+    // 清理 rw 边
+    in_conflict_.erase(xid);
+    // 同时清理其它事务指向 xid 的边
+    for (auto& [_, conflicts] : in_conflict_) {
+        conflicts.erase(xid);
+    }
+}
+
+bool TransactionManager::ssi_is_pivot(TransactionId xid) const {
+    std::lock_guard<std::mutex> lock(ssi_mutex_);
+    auto it = in_conflict_.find(xid);
+    if (it == in_conflict_.end()) return false;
+
+    // 2-cycle: xid →rw T' 且 T' →rw xid
+    for (TransactionId other : it->second) {
+        if (other == xid) continue;
+        auto oit = in_conflict_.find(other);
+        if (oit != in_conflict_.end() && oit->second.count(xid)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // ── Undo ────────────────────────────────────────────────
 
 void TransactionManager::add_undo_record(UndoRecord&& rec) {
     context_.undo_records.push_back(std::move(rec));
+}
+
+// ── Savepoint ───────────────────────────────────────────
+
+void TransactionManager::savepoint(const std::string& name) {
+    Savepoint sp;
+    sp.name = name;
+    sp.undo_position = context_.undo_records.size();
+    context_.savepoints.push_back(sp);
+}
+
+size_t TransactionManager::rollback_to_savepoint(const std::string& name) {
+    // 找到同名 savepoint (取最近一个)
+    for (auto it = context_.savepoints.rbegin(); it != context_.savepoints.rend(); ++it) {
+        if (it->name == name) {
+            size_t current = context_.undo_records.size();
+            size_t target = it->undo_position;
+            // 弹出该 savepoint 之后的所有 savepoint
+            // (嵌套语义: 回滚到 sp1, 之后在 sp1 之后创建的 sp2 也不存在)
+            context_.savepoints.erase(
+                (it + 1).base(), context_.savepoints.end());
+            // 需要回滚的记录数
+            if (current < target) return 0;  // 异常状态
+            return current - target;
+        }
+    }
+    throw std::runtime_error("savepoint \"" + name + "\" 不存在");
+}
+
+void TransactionManager::release_savepoint(const std::string& name) {
+    // 移除 savepoint, 保留其后的所有 undo 记录 (后续提交时仍生效)
+    for (auto it = context_.savepoints.rbegin(); it != context_.savepoints.rend(); ++it) {
+        if (it->name == name) {
+            context_.savepoints.erase((it + 1).base(), context_.savepoints.end());
+            return;
+        }
+    }
+    throw std::runtime_error("savepoint \"" + name + "\" 不存在");
+}
+
+bool TransactionManager::has_savepoint(const std::string& name) const {
+    for (const auto& sp : context_.savepoints) {
+        if (sp.name == name) return true;
+    }
+    return false;
 }
 
 // ── 状态机核心 ──────────────────────────────────────────
@@ -200,6 +379,7 @@ void TransactionManager::start_transaction_command() {
         context_.xid = InvalidTransactionId;
         context_.command_id = 0;
         context_.undo_records.clear();
+        context_.has_snapshot = false;
         context_.block_state = TBlockState::STARTED;
         break;
 
@@ -260,6 +440,7 @@ void TransactionManager::begin_transaction_block() {
         context_.xid = InvalidTransactionId;
         context_.command_id = 0;
         context_.undo_records.clear();
+        context_.has_snapshot = false;
     }
     context_.block_state = TBlockState::BEGIN;
 }
@@ -274,7 +455,14 @@ void TransactionManager::commit_transaction() {
             active_xids_.erase(xid);
         }
         context_.undo_records.clear();
+        context_.has_snapshot = false;
         return;
+    }
+
+    // SSI pivot 检查: 在 SERIALIZABLE 下, 若本事务形成 2-cycle, 必须回滚
+    if (context_.isolation == IsolationLevel::Serializable && ssi_is_pivot(xid)) {
+        // 抛出异常, 由调用方走回滚路径 (apply_undo)
+        throw std::runtime_error("could not serialize access (SSI pivot detected)");
     }
 
     // 标记 CLOG 为 COMMITTED
@@ -286,12 +474,17 @@ void TransactionManager::commit_transaction() {
         active_xids_.erase(xid);
     }
 
+    // 清理 SSI 状态
+    cleanup_transaction_state(xid);
+
     // 清理 undo (已提交无需回滚)
     context_.undo_records.clear();
+    context_.savepoints.clear();
 
     // 重置上下文
     context_.xid = InvalidTransactionId;
     context_.command_id = 0;
+    context_.has_snapshot = false;
 }
 
 void TransactionManager::abort_transaction() {
@@ -310,14 +503,19 @@ void TransactionManager::abort_transaction() {
             std::lock_guard<std::mutex> lock(mutex_);
             active_xids_.erase(xid);
         }
+
+        // 清理 SSI 状态
+        cleanup_transaction_state(xid);
     }
 
     // 清理 undo
     context_.undo_records.clear();
+    context_.savepoints.clear();
 
     // 重置上下文
     context_.xid = InvalidTransactionId;
     context_.command_id = 0;
+    context_.has_snapshot = false;
 }
 
 // ── Checkpoint 序列化 ───────────────────────────────────
@@ -357,6 +555,8 @@ void TransactionManager::reset_context() {
     context_.block_state = TBlockState::DEFAULT;
     context_.command_id = 0;
     context_.undo_records.clear();
+    context_.has_snapshot = false;
+    context_.savepoints.clear();
 }
 
 } // namespace jiamiao

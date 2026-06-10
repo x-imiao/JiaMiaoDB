@@ -95,8 +95,14 @@ public:
 
     // 事务 WAL 与 Undo
     void apply_undo();
+    // 部分回滚: 只回滚最后 count 条 undo 记录 (Savepoint 用)
+    void apply_undo_to(size_t count);
     void write_xact_commit(jiamiao::TransactionId xid);
     void write_xact_abort(jiamiao::TransactionId xid);
+
+    // VACUUM: 物理清理被已提交事务删除的行, 冻结老行 (避免反复 visibility check)
+    // 返回清理的行数
+    int64_t vacuum();
 
 private:
     // 锁目标: 所有 catalog / DDL 操作的虚拟目标
