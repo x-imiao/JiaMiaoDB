@@ -1,6 +1,7 @@
 #ifndef JIAMIAODB_STORAGE_ENGINE_H
 #define JIAMIAODB_STORAGE_ENGINE_H
 
+#include <atomic>
 #include <functional>
 #include <string>
 #include <vector>
@@ -12,6 +13,7 @@
 #include "checkpoint.h"
 #include "transaction.h"
 #include "catalog.h"
+#include "lock_manager.h"
 
 /* ═══════════════════════════════════════════════════════
    StorageEngine — 存储引擎
@@ -19,7 +21,17 @@
    写入路径: WAL (append) → 内存状态 → (可选) Checkpoint
    读取路径: Checkpoint → WAL Replay → 内存状态
    崩溃恢复: 自动，重放 WAL
-   线程安全: 表级锁
+
+   并发模型 (Phase 2):
+   - lifecycle_mutex_: 保护生命周期 (load/save/close) 和 replay.
+     操作极短, 启动期/恢复期单线程即可.
+   - mgr_ (LockManager): 表级锁, 每个 public 方法调用使用唯一 call_xid_:
+       * DML (insert/update/remove/scan):  按表 Exclusive / Shared
+       * DDL (create_table/drop_table/...): Exclusive 锁 __catalog__
+         锁串行化所有 schema 变更
+     不同表上的并发 DML 互不阻塞; 同表读写串行.
+   - call_xid_: 单调递增, 永不重用, 避免与事务 XID 空间冲突
+     (XID 从 FirstNormalTransactionId 起, call_xid 从 FirstCallXid 起).
    ═══════════════════════════════════════════════════════ */
 
 struct IndexInfo {
@@ -87,6 +99,11 @@ public:
     void write_xact_abort(jiamiao::TransactionId xid);
 
 private:
+    // 锁目标: 所有 catalog / DDL 操作的虚拟目标
+    static constexpr const char* kCatalogTarget = "__catalog__";
+    // 锁目标: WAL 串行化
+    static constexpr const char* kWalTarget     = "__wal__";
+
     // 内部状态
     std::map<std::string, TableSchema> tables_;
     std::map<std::string, RowSet> data_;
@@ -100,7 +117,19 @@ private:
 
     std::string data_dir_;
     int checkpoint_interval_;
-    std::mutex global_mutex_;
+
+    // ── 并发原语 (Phase 2) ──
+    // lifecycle: load/save/close/replay, 启动期单线程
+    std::mutex            lifecycle_mutex_;
+    // 表级锁 (取代原 global_mutex_)
+    jiamiao::LockManager  mgr_;
+    // 每个 public 调用分配的"会话 XID", 永不重用
+    std::atomic<uint32_t> call_xid_seq_{jiamiao::FirstNormalTransactionId + 0x10000000u};
+
+    // 内部: 分配 call xid
+    jiamiao::TransactionId next_call_xid() {
+        return call_xid_seq_.fetch_add(1, std::memory_order_relaxed);
+    }
 
     // 内部方法
     void replay_record(const WALRecord& rec);

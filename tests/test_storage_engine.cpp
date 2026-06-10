@@ -1,10 +1,13 @@
 #include "doctest.h"
 #include "storage/engine.h"
 #include "storage/transaction.h"
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
+#include <thread>
 #include <unistd.h>
 
 namespace jm = jiamiao;
@@ -414,4 +417,44 @@ TEST_CASE("StorageEngine: apply_undo rolls back DELETE") {
     auto* name_v = std::get_if<std::string>(&name_it->second);
     REQUIRE(name_v != nullptr);
     CHECK(*name_v == "saved");
+}
+
+TEST_CASE("StorageEngine: concurrent operations on different tables") {
+    TempDir tmp;
+    StorageEngine engine(tmp.path, 10000);
+    engine.create_table("t_a", simple_schema());
+    engine.create_table("t_b", simple_schema());
+
+    std::atomic<int> success_a{0};
+    std::atomic<int> success_b{0};
+    std::atomic<int> errors{0};
+
+    auto writer_a = [&](int id) {
+        try {
+            for (int i = 0; i < 50; ++i) {
+                engine.insert("t_a", make_data_row(id * 1000 + i, "a"));
+                success_a.fetch_add(1);
+            }
+        } catch (...) { errors.fetch_add(1); }
+    };
+    auto writer_b = [&](int id) {
+        try {
+            for (int i = 0; i < 50; ++i) {
+                engine.insert("t_b", make_data_row(id * 1000 + i, "b"));
+                success_b.fetch_add(1);
+            }
+        } catch (...) { errors.fetch_add(1); }
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 4; ++i) threads.emplace_back(writer_a, i);
+    for (int i = 0; i < 4; ++i) threads.emplace_back(writer_b, i);
+    for (auto& t : threads) t.join();
+
+    CHECK(errors.load() == 0);
+    CHECK(success_a.load() == 200);
+    CHECK(success_b.load() == 200);
+    // 验证两边都写入了 200 行
+    CHECK(engine.scan("t_a").size() == 200);
+    CHECK(engine.scan("t_b").size() == 200);
 }

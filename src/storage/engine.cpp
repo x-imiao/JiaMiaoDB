@@ -1,5 +1,6 @@
 #include "engine.h"
 #include "transaction.h"
+#include "lock_manager.h"
 #include <filesystem>
 #include <iostream>
 #include <algorithm>
@@ -7,9 +8,13 @@
 #include "json.h"
 
 using json = Json;
+using jiamiao::LockManager;
+using jiamiao::LockMode;
+using jiamiao::LockTarget;
+using jiamiao::LockTargetType;
 
 StorageEngine::StorageEngine(const std::string& data_dir, int checkpoint_interval)
-    : data_dir_(data_dir), checkpoint_interval_(checkpoint_interval) {
+    : data_dir_(data_dir), checkpoint_interval_(checkpoint_interval), mgr_(30000) {
     if (!std::filesystem::exists(data_dir)) {
         std::filesystem::create_directories(data_dir);
     }
@@ -22,7 +27,7 @@ StorageEngine::StorageEngine(const std::string& data_dir, int checkpoint_interva
 StorageEngine::~StorageEngine() { close(); }
 
 void StorageEngine::load() {
-    std::lock_guard<std::mutex> lock(global_mutex_);
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
 
     // 0. 加载 Catalog
     auto ckp = ckp_mgr_->load();
@@ -107,19 +112,23 @@ void StorageEngine::load() {
 }
 
 void StorageEngine::save() {
-    std::lock_guard<std::mutex> lock(global_mutex_);
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     checkpoint();
 }
 
 void StorageEngine::close() {
-    checkpoint();
+    {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        checkpoint();
+    }
     wal_->close();
 }
 
 /* ─── Catalog ─── */
 
 void StorageEngine::create_database(const std::string& name) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, kCatalogTarget}, LockMode::Exclusive);
     catalog_->create_database(name);
     json data;
     data["name"] = name;
@@ -128,7 +137,8 @@ void StorageEngine::create_database(const std::string& name) {
 }
 
 void StorageEngine::drop_database(const std::string& name) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, kCatalogTarget}, LockMode::Exclusive);
     catalog_->drop_database(name);
     // 删除该数据库下的所有表
     std::string prefix = name + ".";
@@ -151,7 +161,8 @@ void StorageEngine::drop_database(const std::string& name) {
 }
 
 void StorageEngine::create_schema(const std::string& db_name, const std::string& schema_name) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, kCatalogTarget}, LockMode::Exclusive);
     catalog_->create_schema(db_name, schema_name);
     json data;
     data["database"] = db_name;
@@ -161,7 +172,8 @@ void StorageEngine::create_schema(const std::string& db_name, const std::string&
 }
 
 void StorageEngine::create_user(const std::string& name, const std::string& password) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, kCatalogTarget}, LockMode::Exclusive);
     catalog_->create_user(name, password);
     json data;
     data["name"] = name;
@@ -171,7 +183,8 @@ void StorageEngine::create_user(const std::string& name, const std::string& pass
 }
 
 void StorageEngine::drop_user(const std::string& name) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, kCatalogTarget}, LockMode::Exclusive);
     catalog_->drop_user(name);
     json data;
     data["name"] = name;
@@ -188,14 +201,20 @@ void StorageEngine::set_current_db(const std::string& name) {
 }
 
 std::vector<std::string> StorageEngine::list_databases() {
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, kCatalogTarget}, LockMode::Shared);
     return catalog_->list_databases();
 }
 
 std::vector<std::string> StorageEngine::list_users() {
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, kCatalogTarget}, LockMode::Shared);
     return catalog_->list_users();
 }
 
 std::vector<std::string> StorageEngine::list_schemas(const std::string& db_name) {
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, kCatalogTarget}, LockMode::Shared);
     return catalog_->list_schemas(db_name);
 }
 
@@ -206,7 +225,8 @@ std::string StorageEngine::resolve_table_name(const std::string& name) const {
 /* ─── Schema ─── */
 
 void StorageEngine::create_table(const std::string& name, const std::vector<ColumnDef>& columns) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, kCatalogTarget}, LockMode::Exclusive);
     std::string qualified = resolve_table_name(name);
     if (tables_.count(qualified)) {
         throw std::runtime_error("表 \"" + name + "\" 已存在");
@@ -234,7 +254,7 @@ void StorageEngine::create_table(const std::string& name, const std::vector<Colu
     row_ids_[qualified] = 0;
     indexes_[qualified] = {};
 
-    // PK 自动建索引
+    // PK 自动建索引 (catalog 锁已持有, 内部 create_index 不会重入)
     for (const auto& c : columns) {
         if (c.primary_key) {
             create_index(qualified, c.name);
@@ -245,7 +265,8 @@ void StorageEngine::create_table(const std::string& name, const std::vector<Colu
 }
 
 void StorageEngine::drop_table(const std::string& name) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, kCatalogTarget}, LockMode::Exclusive);
     std::string qualified = resolve_table_name(name);
     if (!tables_.count(qualified)) {
         throw std::runtime_error("表 \"" + name + "\" 不存在");
@@ -261,6 +282,8 @@ void StorageEngine::drop_table(const std::string& name) {
 }
 
 TableSchema* StorageEngine::get_schema(const std::string& name) {
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, kCatalogTarget}, LockMode::Shared);
     std::string qualified = resolve_table_name(name);
     auto it = tables_.find(qualified);
     if (it != tables_.end()) return &it->second;
@@ -271,6 +294,8 @@ TableSchema* StorageEngine::get_schema(const std::string& name) {
 }
 
 std::vector<std::string> StorageEngine::list_tables() {
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, kCatalogTarget}, LockMode::Shared);
     std::string prefix = catalog_->current_database() + ".";
     std::vector<std::string> names;
     for (const auto& [name, _] : tables_) {
@@ -284,8 +309,9 @@ std::vector<std::string> StorageEngine::list_tables() {
 /* ─── 数据 ─── */
 
 Row StorageEngine::insert(const std::string& table, const Row& row) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
     std::string qualified = resolve_table_name(table);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, qualified}, LockMode::Exclusive);
     auto schema_it = tables_.find(qualified);
     if (schema_it == tables_.end()) {
         throw std::runtime_error("表 \"" + table + "\" 不存在");
@@ -324,8 +350,9 @@ Row StorageEngine::insert(const std::string& table, const Row& row) {
 }
 
 RowSet StorageEngine::scan(const std::string& table) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
     std::string qualified = resolve_table_name(table);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, qualified}, LockMode::Shared);
     auto it = data_.find(qualified);
     if (it == data_.end()) {
         throw std::runtime_error("表 \"" + table + "\" 不存在");
@@ -337,8 +364,9 @@ RowSet StorageEngine::scan_with_snapshot(const std::string& table,
                                           const jiamiao::Snapshot& snap,
                                           jiamiao::TransactionId xid,
                                           int32_t cid) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
     std::string qualified = resolve_table_name(table);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, qualified}, LockMode::Shared);
     auto it = data_.find(qualified);
     if (it == data_.end()) {
         throw std::runtime_error("表 \"" + table + "\" 不存在");
@@ -354,8 +382,9 @@ RowSet StorageEngine::scan_with_snapshot(const std::string& table,
 
 int64_t StorageEngine::update(const std::string& table, std::function<bool(const Row&)> match,
                                const std::map<std::string, Value>& updates) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
     std::string qualified = resolve_table_name(table);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, qualified}, LockMode::Exclusive);
     auto rows_it = data_.find(qualified);
     if (rows_it == data_.end()) {
         throw std::runtime_error("表 \"" + table + "\" 不存在");
@@ -396,8 +425,9 @@ int64_t StorageEngine::update(const std::string& table, std::function<bool(const
 }
 
 int64_t StorageEngine::remove(const std::string& table, std::function<bool(const Row&)> match) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
     std::string qualified = resolve_table_name(table);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, qualified}, LockMode::Exclusive);
     auto rows_it = data_.find(qualified);
     if (rows_it == data_.end()) {
         throw std::runtime_error("表 \"" + table + "\" 不存在");
@@ -442,8 +472,9 @@ jiamiao::TransactionManager& StorageEngine::txn_mgr() {
 }
 
 Row StorageEngine::insert_with_txn(const std::string& table, const Row& row) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
     std::string qualified = resolve_table_name(table);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, qualified}, LockMode::Exclusive);
     auto schema_it = tables_.find(qualified);
     if (schema_it == tables_.end()) {
         throw std::runtime_error("表 \"" + table + "\" 不存在");
@@ -511,8 +542,9 @@ Row StorageEngine::insert_with_txn(const std::string& table, const Row& row) {
 int64_t StorageEngine::update_with_txn(const std::string& table,
                                         std::function<bool(const Row&)> match,
                                         const std::map<std::string, Value>& updates) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
     std::string qualified = resolve_table_name(table);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, qualified}, LockMode::Exclusive);
     auto rows_it = data_.find(qualified);
     if (rows_it == data_.end()) {
         throw std::runtime_error("表 \"" + table + "\" 不存在");
@@ -626,8 +658,9 @@ int64_t StorageEngine::update_with_txn(const std::string& table,
 
 int64_t StorageEngine::remove_with_txn(const std::string& table,
                                         std::function<bool(const Row&)> match) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
     std::string qualified = resolve_table_name(table);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, qualified}, LockMode::Exclusive);
     auto rows_it = data_.find(qualified);
     if (rows_it == data_.end()) {
         throw std::runtime_error("表 \"" + table + "\" 不存在");
@@ -755,14 +788,16 @@ void StorageEngine::apply_undo() {
 }
 
 void StorageEngine::write_xact_commit(jiamiao::TransactionId xid) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, kWalTarget}, LockMode::Exclusive);
     json data;
     data["_xid"] = static_cast<int64_t>(xid);
     write_wal("xact_commit", "", data, xid);
 }
 
 void StorageEngine::write_xact_abort(jiamiao::TransactionId xid) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, kWalTarget}, LockMode::Exclusive);
     json data;
     data["_xid"] = static_cast<int64_t>(xid);
     write_wal("xact_abort", "", data, xid);
@@ -771,8 +806,9 @@ void StorageEngine::write_xact_abort(jiamiao::TransactionId xid) {
 /* ─── 索引 ─── */
 
 RowSet StorageEngine::index_lookup(const std::string& table, const std::string& column, const Value& value) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
     std::string qualified = resolve_table_name(table);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, qualified}, LockMode::Shared);
     auto idx_it = indexes_.find(qualified);
     if (idx_it == indexes_.end()) return {};
 
@@ -801,8 +837,9 @@ RowSet StorageEngine::index_lookup_with_snapshot(const std::string& table,
                                                    const jiamiao::Snapshot& snap,
                                                    jiamiao::TransactionId xid,
                                                    int32_t cid) {
-    std::lock_guard<std::mutex> lock(global_mutex_);
     std::string qualified = resolve_table_name(table);
+    auto h = mgr_.acquire(next_call_xid(),
+                          {LockTargetType::Table, qualified}, LockMode::Shared);
     auto idx_it = indexes_.find(qualified);
     if (idx_it == indexes_.end()) return {};
 
