@@ -1,4 +1,4 @@
-# JiaoMiaoDB
+# JiaMiaoDB
 
 AI Native Database · v2.1.0
 
