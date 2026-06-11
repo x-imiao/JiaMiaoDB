@@ -14,6 +14,8 @@
 #include "transaction.h"
 #include "catalog.h"
 #include "lock_manager.h"
+#include "tuple.h"
+#include "memtable.h"
 
 /* ═══════════════════════════════════════════════════════
    StorageEngine — 存储引擎
@@ -112,7 +114,8 @@ private:
 
     // 内部状态
     std::map<std::string, TableSchema> tables_;
-    std::map<std::string, RowSet> data_;
+    // Phase 1 LSM: data_ 改为 MemTable 集合. value = 唯一所有权, 跨调用零拷贝.
+    std::map<std::string, std::unique_ptr<jiamiao::MemTable>> data_;
     std::map<std::string, int64_t> row_ids_;
     std::map<std::string, std::vector<IndexInfo>> indexes_;
 

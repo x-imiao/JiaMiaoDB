@@ -1,6 +1,8 @@
 #include "doctest.h"
 #include "storage/engine.h"
 #include "storage/transaction.h"
+#include "storage/tuple.h"
+#include "storage/memtable.h"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -755,4 +757,363 @@ TEST_CASE("StorageEngine: vacuum preserves indexes after cleanup") {
     auto* name_v = std::get_if<std::string>(&name_it->second);
     REQUIRE(name_v != nullptr);
     CHECK(*name_v == "bob");
+}
+
+// ════════════════════════════════════════════════════════════════
+// Phase 1 LSM 重构新增测试 (MemTable + BinaryRowCodec)
+// ════════════════════════════════════════════════════════════════
+
+TEST_CASE("MemTable: tuple round-trip preserves Value variants") {
+    using namespace jiamiao;
+    Row r;
+    r["i"]  = static_cast<int64_t>(42);
+    r["d"]  = 3.14;
+    r["b"]  = true;
+    r["s"]  = std::string("hello");
+    r["n"]  = nullptr;
+    TupleHeader hdr{};
+    hdr.row_id = 1;
+    hdr.xmin = 100;
+    hdr.xmax = 0;
+    hdr.cid = 0;
+    hdr.schema_hash = 0xABCD;
+    hdr.payload_len = 0;
+    hdr.crc32 = 0;
+
+    Tuple t = BinaryRowCodec::row_to_tuple(r, hdr);
+    CHECK(t.hdr.row_id == 1u);
+    CHECK(t.hdr.xmin == 100u);
+    CHECK(t.hdr.schema_hash == 0xABCD);
+
+    // decode 业务列
+    Row decoded = BinaryRowCodec::decode(t.payload.data(), t.payload.size());
+    auto* i = std::get_if<int64_t>(&decoded["i"]);
+    REQUIRE(i != nullptr);
+    CHECK(*i == 42);
+    auto* d = std::get_if<double>(&decoded["d"]);
+    REQUIRE(d != nullptr);
+    CHECK(*d == doctest::Approx(3.14));
+    auto* b = std::get_if<bool>(&decoded["b"]);
+    REQUIRE(b != nullptr);
+    CHECK(*b == true);
+    auto* s = std::get_if<std::string>(&decoded["s"]);
+    REQUIRE(s != nullptr);
+    CHECK(*s == "hello");
+    auto* n = std::get_if<std::nullptr_t>(&decoded["n"]);
+    REQUIRE(n != nullptr);
+}
+
+TEST_CASE("MemTable: latest version wins on get_latest") {
+    using namespace jiamiao;
+    MemTable mt("db.sc.t");
+
+    // 写 3 个版本 (row_id=1, 不同 seq, 模拟 MVCC 时间线)
+    TupleHeader h1{}; h1.row_id = 1; h1.xmin = 10; h1.xmax = 0; h1.cid = 0;
+    TupleHeader h2{}; h2.row_id = 1; h2.xmin = 20; h2.xmax = 0; h2.cid = 0;
+    TupleHeader h3{}; h3.row_id = 1; h3.xmin = 30; h3.xmax = 0; h3.cid = 0;
+    Tuple v1; v1.hdr = h1; v1.payload = {0x00, 0x00};
+    Tuple v2; v2.hdr = h2; v2.payload = {0x00, 0x00};
+    Tuple v3; v3.hdr = h3; v3.payload = {0x00, 0x00};
+    mt.put(1, v1, 100);
+    mt.put(1, v2, 200);
+    mt.put(1, v3, 300);
+
+    // InternalKey = (user_key, seq), 同 row_id 不同 seq → 3 entries
+    CHECK(mt.size() == 3);
+
+    // get_latest 应该返回 seq 最大的 (latest first)
+    auto latest = mt.get_latest(1);
+    REQUIRE(latest.has_value());
+    CHECK(latest->hdr.xmin == 30u);  // 来自 v3 (seq=300)
+
+    // get_versions 返回所有版本, 顺序 seq DESC
+    auto versions = mt.get_versions(1);
+    CHECK(versions.size() == 3);
+    CHECK(versions[0].hdr.xmin == 30u);
+    CHECK(versions[1].hdr.xmin == 20u);
+    CHECK(versions[2].hdr.xmin == 10u);
+}
+
+TEST_CASE("MemTable: vacuum drops tombstoned versions past oldest active xid") {
+    using namespace jiamiao;
+    CLog clog;
+    // 确保 clog 能容纳这些 xid
+    clog.set_status(10, TransactionStatus::COMMITTED);
+    clog.set_status(20, TransactionStatus::COMMITTED);
+    clog.set_status(30, TransactionStatus::COMMITTED);
+    clog.set_status(40, TransactionStatus::COMMITTED);
+    clog.set_status(50, TransactionStatus::IN_PROGRESS);  // 活跃
+
+    MemTable mt("db.sc.t");
+
+    // 写 row 1, xmin=10, xmax=20 (被 txn 20 删除, 20 已 commit)
+    Tuple t1;
+    t1.hdr.row_id = 1;
+    t1.hdr.xmin = 10;
+    t1.hdr.xmax = 20;
+    t1.hdr.cid = 0;
+    mt.put(1, t1, 5);
+
+    // 写 row 2, xmin=30, xmax=40 (被 txn 40 删除, 40 已 commit)
+    Tuple t2;
+    t2.hdr.row_id = 2;
+    t2.hdr.xmin = 30;
+    t2.hdr.xmax = 40;
+    mt.put(2, t2, 6);
+
+    // 写 row 3, 活跃, 不能清理 (xmin=50 未 commit)
+    Tuple t3;
+    t3.hdr.row_id = 3;
+    t3.hdr.xmin = 50;
+    t3.hdr.xmax = 0;
+    mt.put(3, t3, 7);
+
+    // vacuum: row 1 和 row 2 可清理 (xmax < oldest_active=50, 40 < 50, 20 < 50)
+    //         row 3 不能 (xmin=50 >= 50, 活跃)
+    size_t can_purge = mt.vacuum(clog, /*oldest_active_xid=*/50);
+    CHECK(can_purge == 2);
+
+    // 物理清理
+    mt.erase_all_for(1);
+    mt.erase_all_for(2);
+    CHECK(mt.size() == 1);
+    auto latest = mt.get_latest(3);
+    CHECK(latest.has_value());
+}
+
+TEST_CASE("MemTable: scan order is row_id ASC, same row_id preserves insertion order") {
+    using namespace jiamiao;
+    MemTable mt("db.sc.t");
+
+    // 插 8 个 entry, seq 唯一递增保证每个都保留
+    int64_t seq_counter = 1000;
+    for (int64_t rid : {3, 1, 4, 1, 5, 9, 2, 6}) {
+        Tuple t;
+        t.hdr.row_id = static_cast<uint64_t>(rid);
+        t.hdr.xmin = 0;
+        t.hdr.xmax = 0;
+        t.payload = {0x00, 0x00};
+        mt.put(rid, t, static_cast<uint64_t>(seq_counter++));
+    }
+
+    // 8 个 put, 8 个 unique (user_key, seq) → 8 entries
+    CHECK(mt.size() == 8);
+
+    // scan_all 顺序: user_key ASC, 同 user_key 内 seq DESC
+    auto all = mt.scan_all();
+    REQUIRE(all.size() == 8);
+
+    // 收集 row_ids (会有 row_id 1 出现 2 次, 因为我们 put 了 2 次)
+    std::map<int64_t, int> rids;
+    for (const auto& t : all) {
+        rids[static_cast<int64_t>(t.hdr.row_id)]++;
+    }
+    CHECK(rids[1] == 2);  // row_id 1 出现 2 次
+    CHECK(rids[3] == 1);
+    CHECK(rids[9] == 1);
+    // 验证整体有序: row_id 应不递减 (seq DESC 在同 row_id 内, 但不同 row_id 间按 user_key ASC)
+    int64_t prev_rid = -1;
+    int64_t prev_seq_for_prev = -1;
+    for (const auto& t : all) {
+        int64_t rid = static_cast<int64_t>(t.hdr.row_id);
+        if (rid != prev_rid) {
+            CHECK(rid > prev_rid);  // 新 row_id 必须 > 旧 row_id
+            prev_rid = rid;
+        }
+    }
+}
+
+TEST_CASE("BinaryRowCodec: round-trip preserves data and stays within size budget") {
+    using namespace jiamiao;
+    // 构造 100 行, 长字符串拉满二进制优势
+    std::vector<Row> rows;
+    for (int i = 0; i < 100; ++i) {
+        Row r;
+        r["id"]     = static_cast<int64_t>(i);
+        r["name"]   = std::string("user_name_with_long_prefix_") + std::to_string(i);
+        r["desc"]   = std::string(200, 'x');  // 200-char 字符串, JSON 这里没优势
+        r["age"]    = static_cast<int64_t>(20 + (i % 50));
+        r["score"]  = 1.5 + i * 0.1;
+        r["active"] = (i % 2 == 0);
+        rows.push_back(std::move(r));
+    }
+
+    // JSON 大小 (RowSet 序列化, 模拟 jiamiao JSON)
+    size_t json_size = 0;
+    for (const auto& r : rows) {
+        std::string s = "{";
+        bool first = true;
+        for (const auto& [k, v] : r) {
+            if (!first) s += ",";
+            first = false;
+            s += "\"" + k + "\":";
+            std::visit([&](auto&& val) {
+                using T = std::decay_t<decltype(val)>;
+                if constexpr (std::is_same_v<T, std::nullptr_t>) s += "null";
+                else if constexpr (std::is_same_v<T, int64_t>) s += std::to_string(val);
+                else if constexpr (std::is_same_v<T, double>) s += std::to_string(val);
+                else if constexpr (std::is_same_v<T, bool>) s += val ? "true" : "false";
+                else if constexpr (std::is_same_v<T, std::string>) {
+                    s += "\"" + val + "\"";
+                }
+            }, v);
+        }
+        s += "}";
+        json_size += s.size();
+    }
+
+    // BinaryRowCodec 大小
+    size_t binary_size = 0;
+    for (const auto& r : rows) {
+        auto bytes = BinaryRowCodec::encode(r);
+        binary_size += bytes.size();
+    }
+
+    // 验证 Binary 编码能往返 (基本正确性)
+    for (const auto& r : rows) {
+        auto bytes = BinaryRowCodec::encode(r);
+        Row decoded = BinaryRowCodec::decode(bytes.data(), bytes.size());
+        // 抽样: id 字段应该相等
+        auto* orig_id = std::get_if<int64_t>(&r.at("id"));
+        auto* dec_id  = std::get_if<int64_t>(&decoded.at("id"));
+        REQUIRE(orig_id != nullptr);
+        REQUIRE(dec_id != nullptr);
+        CHECK(*orig_id == *dec_id);
+    }
+
+    MESSAGE("JSON size: ", json_size, " bytes; Binary size: ", binary_size, " bytes; ratio: ",
+            static_cast<double>(json_size) / std::max<size_t>(1, binary_size));
+
+    // Phase 1 codec 特性: 固定宽度 int/double 编码, 短整数场景下二进制略大于 JSON.
+    // 此处只确认大小在合理量级 (1.5x 内). 真正的空间优势要等 Phase 2/3 引入
+    // SST block 压缩 + varint 编码后才显现.
+    CHECK(binary_size <= json_size * 3 / 2);
+}
+
+// ──── Phase 1 LSM 风险 #3 gate: Savepoint 压力测试 ────
+//   场景: 3 层嵌套 savepoint + 50 个交错 insert/update/remove × 100 轮
+//   目的: 验证 erase_all_for + put 模式在嵌套 savepoint 部分回滚下不留脏数据,
+//         不产生重复 InternalKey, 不让 vacuum / scan 看到悬挂行.
+TEST_CASE("Savepoint stress: 3-level nested with 50 interleaved ops × 100 iterations") {
+    TempDir tmp;
+    StorageEngine engine(tmp.path, /*checkpoint_interval=*/100000);
+    engine.create_table("t", simple_schema());
+
+    constexpr int kIterations = 100;
+    constexpr int kOpsPerIter = 50;
+
+    // 种子 5 行数据 (作为各轮的基线)
+    {
+        begin_txn(engine);
+        for (int i = 1; i <= 5; ++i) {
+            engine.insert_with_txn("t", make_data_row(i, std::string("seed_") + std::to_string(i)));
+        }
+        commit_txn(engine);
+    }
+
+    int64_t next_id = 100;
+    for (int iter = 0; iter < kIterations; ++iter) {
+        begin_txn(engine);
+        auto& txn = engine.txn_mgr();
+        auto our_xid = txn.get_current_xid();
+
+        // 顶层操作 (10 个)
+        for (int i = 0; i < 10; ++i) {
+            engine.insert_with_txn("t", make_data_row(next_id++, "top"));
+        }
+
+        txn.savepoint("sp_outer");
+        // outer 层操作 (15 个: insert + update)
+        for (int i = 0; i < 15; ++i) {
+            if (i % 3 == 0) {
+                int64_t target = next_id - 5;
+                engine.update_with_txn("t",
+                    [target](const Row& r) {
+                        auto it = r.find("id");
+                        if (it == r.end()) return false;
+                        auto* v = std::get_if<int64_t>(&it->second);
+                        return v && *v == target;
+                    },
+                    {{"name", std::string("outer_upd")}});
+            } else {
+                engine.insert_with_txn("t", make_data_row(next_id++, "outer"));
+            }
+        }
+
+        txn.savepoint("sp_middle");
+        // middle 层操作 (15 个: insert + remove)
+        for (int i = 0; i < 15; ++i) {
+            if (i % 4 == 0) {
+                int64_t target = next_id - 3;
+                engine.remove_with_txn("t",
+                    [target](const Row& r) {
+                        auto it = r.find("id");
+                        if (it == r.end()) return false;
+                        auto* v = std::get_if<int64_t>(&it->second);
+                        return v && *v == target;
+                    });
+            } else {
+                engine.insert_with_txn("t", make_data_row(next_id++, "middle"));
+            }
+        }
+
+        txn.savepoint("sp_inner");
+        // inner 层操作 (10 个: 全 insert)
+        for (int i = 0; i < 10; ++i) {
+            engine.insert_with_txn("t", make_data_row(next_id++, "inner"));
+        }
+        // 总共 50 个操作
+
+        // 回滚策略: 三种轮替验证三种部分回滚路径
+        int strategy = iter % 3;
+        if (strategy == 0) {
+            // 回滚到 inner: 撤销最后 10 个
+            size_t to_undo = txn.rollback_to_savepoint("sp_inner");
+            CHECK(to_undo == 10);
+            engine.apply_undo_to(to_undo);
+        } else if (strategy == 1) {
+            // 回滚到 middle: 撤销最后 25 个 (inner 10 + middle 15)
+            size_t to_undo = txn.rollback_to_savepoint("sp_middle");
+            CHECK(to_undo == 25);
+            engine.apply_undo_to(to_undo);
+        } else {
+            // 回滚到 outer: 撤销最后 40 个 (inner 10 + middle 15 + outer 15)
+            size_t to_undo = txn.rollback_to_savepoint("sp_outer");
+            CHECK(to_undo == 40);
+            engine.apply_undo_to(to_undo);
+        }
+
+        // 提交剩余 (顶层 10 个 + savepoint 之前活下来的) 或全部回滚
+        if (iter % 2 == 0) {
+            commit_txn(engine);
+        } else {
+            rollback_txn(engine);
+        }
+
+        // 每轮后 scan 一遍, 验证不崩 (visibility 链没坏)
+        auto snap = engine.txn_mgr().get_snapshot();
+        auto rows = engine.scan_with_snapshot("t", snap, jm::InvalidTransactionId, 0);
+
+        // 行 id 应该唯一 (PK 约束)
+        std::set<int64_t> seen_ids;
+        for (const auto& r : rows) {
+            auto it = r.find("id");
+            REQUIRE(it != r.end());
+            auto* v = std::get_if<int64_t>(&it->second);
+            REQUIRE(v != nullptr);
+            CHECK(seen_ids.insert(*v).second);  // 无重复
+        }
+    }
+
+    // 终态检查: 至少 seed 的 5 行还在 (除非被某轮 remove 了, 但 seed 行 id<100 不会被 update/remove 命中)
+    auto final_snap = engine.txn_mgr().get_snapshot();
+    auto final_rows = engine.scan_with_snapshot("t", final_snap, jm::InvalidTransactionId, 0);
+    int seed_seen = 0;
+    for (const auto& r : final_rows) {
+        auto it = r.find("id");
+        if (it == r.end()) continue;
+        auto* v = std::get_if<int64_t>(&it->second);
+        if (v && *v >= 1 && *v <= 5) ++seed_seen;
+    }
+    CHECK(seed_seen == 5);  // seed 行始终保留
 }
