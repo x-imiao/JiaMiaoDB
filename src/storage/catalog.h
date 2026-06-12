@@ -4,9 +4,10 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <tuple>
 #include <cstdint>
 #include <stdexcept>
-#include "json.h"
+#include "common/json.h"
 
 using json = Json;
 
@@ -69,6 +70,21 @@ public:
     json to_json() const;
     void from_json(const json& j);
     bool has_data() const { return !databases_.empty() || !users_.empty(); }
+
+    // ── Internal accessors (供 catalog_codec 序列化使用, 不暴露给业务) ──
+    //   业务代码不应使用. catalog_codec 内部用 Snapshot 拿只读视图,
+    //   internal_set_user 绕过 hash_password 直接灌入 hash + salt (用于 load 恢复)
+    struct Snapshot {
+        std::string current_db;
+        std::vector<std::pair<std::string, std::vector<std::string>>>
+            databases;  // db_name -> [schema_name, ...]
+        std::vector<std::tuple<std::string, std::string, std::string>>
+            users;      // (name, password_hash, salt)
+    };
+    Snapshot internal_snapshot() const;
+    void     internal_set_user(const std::string& name,
+                               const std::string& password_hash,
+                               const std::string& salt);
 
 private:
     std::map<std::string, DatabaseInfo> databases_;

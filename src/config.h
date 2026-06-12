@@ -5,7 +5,7 @@
 #include <vector>
 #include <fstream>
 #include <iostream>
-#include "json.h"
+#include "common/json.h"
 
 using json = Json;
 

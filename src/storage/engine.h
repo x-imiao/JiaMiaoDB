@@ -10,7 +10,6 @@
 #include <mutex>
 #include "../types.h"
 #include "common/memcontext.h"
-#include "wal.h"
 #include "wal_v3.h"
 #include "checkpoint.h"
 #include "transaction.h"
@@ -38,10 +37,7 @@
      (XID 从 FirstNormalTransactionId 起, call_xid 从 FirstCallXid 起).
    ═══════════════════════════════════════════════════════ */
 
-struct IndexInfo {
-    std::string column;
-    std::map<std::string, std::vector<int64_t>> entries; // value → row indices
-};
+// IndexInfo 已移至 types.h
 
 class StorageEngine {
 public:
@@ -152,7 +148,8 @@ private:
     }
 
     // 内部方法
-    void replay_record(const WALRecord& rec);
+    // replay_record (O-1): 直接吃 WALRecordV3, payload 字段为二进制
+    void replay_record(const jiamiao::WALRecordV3& rec);
     void checkpoint();
     void maybe_checkpoint();
     bool updates_affect_index(const std::string& table, const std::map<std::string, Value>& updates);
@@ -162,9 +159,9 @@ private:
     Row validate(const TableSchema& schema, const Row& row);
     Value coerce(DataType type, const Value& v);
 
-    // WAL 写入
+    // WAL 写入 (O-1: data 是二进制 payload, 不再是 json)
     int64_t next_seq();
-    void write_wal(const std::string& op, const std::string& table, const json& data,
+    void write_wal(jiamiao::WalOp op, const std::string& table, std::string payload,
                    jiamiao::TransactionId xid = jiamiao::InvalidTransactionId);
     int64_t wal_seq_ = 0;
 };

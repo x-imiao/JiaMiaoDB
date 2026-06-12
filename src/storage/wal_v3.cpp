@@ -16,8 +16,6 @@
 #include <stdexcept>
 #include <unordered_map>
 
-#include "wal.h"  // v2 WALRecord, for fallback parse
-
 static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__,
               "WAL v3 binary format is little-endian; this platform is big-endian");
 
@@ -348,39 +346,8 @@ std::vector<WALRecordV3> WriteAheadLogV3::replay(int64_t from_seq) {
             pos += consumed;
         }
     } else {
-        // v2 fallback: JSON Lines, 逐行解析
-        std::string text(buf.begin(), buf.end());
-        size_t start = 0;
-        while (start < text.size()) {
-            size_t eol = text.find('\n', start);
-            std::string line = (eol == std::string::npos)
-                                 ? text.substr(start)
-                                 : text.substr(start, eol - start);
-            start = (eol == std::string::npos) ? text.size() : eol + 1;
-            if (line.empty()) continue;
-            try {
-                auto j = json::parse(line);
-                WALRecordV3 rec;
-                rec.seq       = j["seq"].get_int();
-                rec.timestamp = j.value("ts", static_cast<int64_t>(0));
-                rec.table     = j["table"].get_string();
-                std::string op_str = j["op"].get_string();
-                rec.op = op_to_enum(op_str);
-                // v2 没有独立 xid, 在 data._xid (engine.cpp write_wal 写入)
-                if (j["data"].is_object() && j["data"]["_xid"].is_int()) {
-                    rec.xid = static_cast<uint32_t>(j["data"]["_xid"].get_int());
-                }
-                rec.data = j["data"].dump();
-                if (rec.seq > from_seq) {
-                    seq_ = std::max(seq_, rec.seq);
-                    out.push_back(std::move(rec));
-                } else {
-                    seq_ = std::max(seq_, rec.seq);
-                }
-            } catch (...) {
-                // 跳过损坏的行
-            }
-        }
+        // O-5 后: 没有 v2 WAL 写入, 老 v2 文件无法回放 — 视为空
+        std::cerr << "[WAL v3] 文件不含 JMDB magic, 不是 v3 格式 (v2 已被删除), 跳过" << std::endl;
     }
 
     return out;

@@ -95,6 +95,13 @@ struct TableSchema {
     int64_t row_count = 0;
 };
 
+// ── 索引 ── (从 engine.h 移过来, 避免 checkpoint.h / engine.h 循环)
+
+struct IndexInfo {
+    std::string column;
+    std::map<std::string, std::vector<int64_t>> entries; // value → row indices
+};
+
 // ── 表达式 (AST) ──
 
 struct Expression;

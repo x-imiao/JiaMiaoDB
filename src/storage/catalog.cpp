@@ -385,6 +385,33 @@ void Catalog::from_json(const json& j) {
     current_db_ = j.value("current_db", std::string("defaultdb"));
 }
 
+// ── Internal accessors (供 catalog_codec 序列化, 不暴露给业务) ──
+
+Catalog::Snapshot Catalog::internal_snapshot() const {
+    Snapshot s;
+    s.current_db = current_db_;
+    for (const auto& [db_name, db] : databases_) {
+        std::vector<std::string> schemas;
+        schemas.reserve(db.schemas.size());
+        for (const auto& [sn, _] : db.schemas) schemas.push_back(sn);
+        s.databases.emplace_back(db_name, std::move(schemas));
+    }
+    for (const auto& [uname, u] : users_) {
+        s.users.emplace_back(uname, u.password_hash, u.salt);
+    }
+    return s;
+}
+
+void Catalog::internal_set_user(const std::string& name,
+                                const std::string& password_hash,
+                                const std::string& salt) {
+    UserInfo u;
+    u.name = name;
+    u.password_hash = password_hash;
+    u.salt = salt;
+    users_[name] = std::move(u);
+}
+
 // ── Crypto ──
 
 std::string Catalog::sha256(const std::string& data) const {

@@ -3,11 +3,14 @@
 #include "lock_manager.h"
 #include "tuple.h"
 #include "memtable.h"
+#include "wal_payload.h"
+#include "catalog_codec.h"
+#include "clog_codec.h"
 #include <filesystem>
 #include <iostream>
 #include <algorithm>
 #include <sstream>
-#include "json.h"
+#include "common/json.h"
 
 using json = Json;
 using jiamiao::LockManager;
@@ -20,6 +23,8 @@ using jiamiao::Tuple;
 using jiamiao::TupleHeader;
 using jiamiao::TransactionId;
 using jiamiao::TransactionStatus;
+using jiamiao::WalOp;
+using jiamiao::WALRecordV3;
 
 // ── 投影: Tuple → Row (含系统列 _rowid/_xmin/_xmax/_cid) ──
 //   用途: 给 check_tuple_visibility / executor / tests 用.
@@ -117,8 +122,16 @@ void StorageEngine::load() {
     auto ckp = ckp_mgr_->load();
     wal_seq_ = ckp.last_seq;
 
-    bool is_old_checkpoint = ckp.catalog_data.is_null() || !ckp.catalog_data.contains("databases");
-    if (!ckp.catalog_data.is_null() && ckp.catalog_data.contains("databases")) {
+    // O-3: 优先用 binary catalog (v3 checkpoint), 兜底走 JSON (v2 / legacy)
+    bool is_old_checkpoint = true;
+    if (!ckp.catalog_bytes.empty()) {
+        if (!jiamiao::catalog_decode(ckp.catalog_bytes, catalog_.get())) {
+            std::cerr << "[Engine] Catalog binary decode failed; falling back to JSON\n";
+        } else {
+            is_old_checkpoint = false;  // binary catalog 加载成功
+        }
+    }
+    if (is_old_checkpoint && !ckp.catalog_data.is_null() && ckp.catalog_data.contains("databases")) {
         catalog_->from_json(ckp.catalog_data);
     }
     // else: catalog_ already has defaultdb from constructor
@@ -138,27 +151,13 @@ void StorageEngine::load() {
         indexes_[qualified_name] = {};
 
         // 恢复数据
-        if (ckp.table_data.find(t.name) != ckp.table_data.end()) {
-            for (const auto& row_json : ckp.table_data[t.name]) {
-                Row row;
-                for (auto it = row_json.obj_begin(); it != row_json.obj_end(); ++it) {
-                    const auto& v = it->second;
-                    if (v.is_null()) row[it->first] = nullptr;
-                    else if (v.is_int()) row[it->first] = v.get_int();
-                    else if (v.is_float()) row[it->first] = v.get_float();
-                    else if (v.is_bool()) row[it->first] = v.get_bool();
-                    else row[it->first] = v.get_string();
-                }
+        if (ckp.table_rows.find(t.name) != ckp.table_rows.end()) {
+            for (const auto& [rid, row] : ckp.table_rows[t.name]) {
                 // Phase 1: checkpoint 不带 xmin/xmax/cid, 用 InvalidTransactionId 占位.
                 // load 阶段不需要 MVCC, 系统列由 tuple_to_row_for_visibility 补齐.
-                int64_t rid = 0;
-                auto rid_it = row.find("_rowid");
-                if (rid_it != row.end()) {
-                    if (auto* v = std::get_if<int64_t>(&rid_it->second)) rid = *v;
-                }
                 TupleHeader hdr = header_from_row(qualified_name, rid, row);
-                auto t = BinaryRowCodec::row_to_tuple(row, hdr);
-                data_[qualified_name]->put(rid, t, ++wal_seq_);
+                auto tup = BinaryRowCodec::row_to_tuple(row, hdr);
+                data_[qualified_name]->put(rid, tup, ++wal_seq_);
             }
         }
 
@@ -168,17 +167,8 @@ void StorageEngine::load() {
         }
 
         // 恢复索引
-        if (ckp.indexes.find(t.name) != ckp.indexes.end()) {
-            for (const auto& idx_json : ckp.indexes[t.name]) {
-                IndexInfo idx;
-                idx.column = idx_json["column"].get_string();
-                for (auto it = idx_json["entries"].obj_begin(); it != idx_json["entries"].obj_end(); ++it) {
-                    std::vector<int64_t> indices;
-                    for (const auto& v : it->second) indices.push_back(v.get_int());
-                    idx.entries[it->first] = indices;
-                }
-                indexes_[qualified_name].push_back(std::move(idx));
-            }
+        if (ckp.indexes_data.find(t.name) != ckp.indexes_data.end()) {
+            indexes_[qualified_name] = ckp.indexes_data[t.name];
         }
     }
 
@@ -186,31 +176,23 @@ void StorageEngine::load() {
     if (ckp.next_xid >= jiamiao::FirstNormalTransactionId) {
         txn_mgr_->set_next_xid(ckp.next_xid);
     }
-    if (!ckp.clog_entries.is_null()) {
+    if (!ckp.clog_bytes.empty()) {
+        // O-4: 优先 binary clog
+        if (!jiamiao::clog_decode(ckp.clog_bytes, &txn_mgr_->clog())) {
+            std::cerr << "[Engine] CLog binary decode failed; falling back to JSON\n";
+        }
+    } else if (!ckp.clog_entries.is_null()) {
+        // 旧 v3 文件 fallback: JSON
         txn_mgr_->clog().from_json(ckp.clog_entries);
     }
     txn_mgr_->rebuild_active_from_clog();
     txn_mgr_->reset_context();
 
-    // 3. 重放 WAL (v3 binary 或 v2 JSON fallback)
+    // 3. 重放 WAL (Phase 3a: v3 binary payload, replay 直接吃 v3 记录)
     wal_->open();
     auto records = wal_->replay(ckp.last_seq);
     for (const auto& v3rec : records) {
-        // 把 v3 记录转回 WALRecord (替代 op enum 用 string, data JSON 文本 parse 回 json)
-        WALRecord rec;
-        rec.seq       = v3rec.seq;
-        rec.timestamp = v3rec.timestamp;
-        rec.op        = jiamiao::enum_to_op(v3rec.op);
-        rec.table     = v3rec.table;
-        if (!v3rec.data.empty()) {
-            try {
-                rec.data = json::parse(v3rec.data);
-            } catch (...) {
-                rec.data = json();  // 损坏的 JSON, 跳过
-                continue;
-            }
-        }
-        replay_record(rec);
+        replay_record(v3rec);
     }
 
     std::cout << "[存储] 已加载 " << tables_.size() << " 个表, "
@@ -237,9 +219,8 @@ void StorageEngine::create_database(const std::string& name) {
     auto h = mgr_.acquire(next_call_xid(),
                           {LockTargetType::Table, kCatalogTarget}, LockMode::Exclusive);
     catalog_->create_database(name);
-    json data;
-    data["name"] = name;
-    write_wal("create_database", name, data);
+    // O-1: payload 为空, name 在 WALRecordV3.table
+    write_wal(WalOp::kCreateDatabase, name, jiamiao::wal_encode_empty());
     maybe_checkpoint();
 }
 
@@ -261,9 +242,8 @@ void StorageEngine::drop_database(const std::string& name) {
         row_ids_.erase(t);
         indexes_.erase(t);
     }
-    json data;
-    data["name"] = name;
-    write_wal("drop_database", name, data);
+    // O-1: payload 为空, name 在 WALRecordV3.table
+    write_wal(WalOp::kDropDatabase, name, jiamiao::wal_encode_empty());
     maybe_checkpoint();
 }
 
@@ -271,10 +251,10 @@ void StorageEngine::create_schema(const std::string& db_name, const std::string&
     auto h = mgr_.acquire(next_call_xid(),
                           {LockTargetType::Table, kCatalogTarget}, LockMode::Exclusive);
     catalog_->create_schema(db_name, schema_name);
-    json data;
-    data["database"] = db_name;
-    data["schema"] = schema_name;
-    write_wal("create_schema", db_name, data);
+    // O-1: 二进制 payload (schema name); database name 在 WALRecordV3.table
+    jiamiao::CreateSchemaPayload p;
+    p.schema = schema_name;
+    write_wal(WalOp::kCreateSchema, db_name, jiamiao::wal_encode_create_schema(p));
     maybe_checkpoint();
 }
 
@@ -282,10 +262,8 @@ void StorageEngine::create_user(const std::string& name, const std::string& pass
     auto h = mgr_.acquire(next_call_xid(),
                           {LockTargetType::Table, kCatalogTarget}, LockMode::Exclusive);
     catalog_->create_user(name, password);
-    json data;
-    data["name"] = name;
-    // 不记录密码到 WAL
-    write_wal("create_user", name, data);
+    // O-1: payload 为空; name 在 WALRecordV3.table. 不记录密码到 WAL.
+    write_wal(WalOp::kCreateUser, name, jiamiao::wal_encode_empty());
     maybe_checkpoint();
 }
 
@@ -293,9 +271,8 @@ void StorageEngine::drop_user(const std::string& name) {
     auto h = mgr_.acquire(next_call_xid(),
                           {LockTargetType::Table, kCatalogTarget}, LockMode::Exclusive);
     catalog_->drop_user(name);
-    json data;
-    data["name"] = name;
-    write_wal("drop_user", name, data);
+    // O-1: payload 为空; name 在 WALRecordV3.table
+    write_wal(WalOp::kDropUser, name, jiamiao::wal_encode_empty());
     maybe_checkpoint();
 }
 
@@ -339,18 +316,10 @@ void StorageEngine::create_table(const std::string& name, const std::vector<Colu
         throw std::runtime_error("表 \"" + name + "\" 已存在");
     }
 
-    json data;
-    data["columns"] = json::array();
-    for (const auto& c : columns) {
-        json col;
-        col["name"] = c.name;
-        col["type"] = data_type_name(c.type);
-        col["nullable"] = c.nullable;
-        col["primary_key"] = c.primary_key;
-        data["columns"].push_back(col);
-    }
-
-    write_wal("create_table", qualified, data);
+    // O-1: 二进制 payload (columns); table name 在 WALRecordV3.table
+    jiamiao::CreateTablePayload ctp;
+    ctp.columns = columns;
+    write_wal(WalOp::kCreateTable, qualified, jiamiao::wal_encode_create_table(ctp));
 
     TableSchema schema;
     schema.name = qualified;
@@ -379,7 +348,8 @@ void StorageEngine::drop_table(const std::string& name) {
         throw std::runtime_error("表 \"" + name + "\" 不存在");
     }
 
-    write_wal("drop_table", qualified, {});
+    // O-1: payload 为空; qualified 在 WALRecordV3.table
+    write_wal(WalOp::kDropTable, qualified, jiamiao::wal_encode_empty());
 
     tables_.erase(qualified);
     data_.erase(qualified);
@@ -431,22 +401,11 @@ Row StorageEngine::insert(const std::string& table, const Row& row) {
     validated["_xmax"] = static_cast<int64_t>(0);
     validated["_cid"]  = static_cast<int64_t>(0);
 
-    json row_json;
-    for (const auto& [k, v] : validated) {
-        std::visit([&](auto&& val) {
-            using T = std::decay_t<decltype(val)>;
-            if constexpr (std::is_same_v<T, std::nullptr_t>) row_json[k] = nullptr;
-            else if constexpr (std::is_same_v<T, int64_t>) row_json[k] = val;
-            else if constexpr (std::is_same_v<T, double>) row_json[k] = val;
-            else if constexpr (std::is_same_v<T, bool>) row_json[k] = val;
-            else if constexpr (std::is_same_v<T, std::string>) row_json[k] = val;
-        }, v);
-    }
-
-    json data;
-    data["row"] = row_json;
-    data["rowid"] = id;
-    write_wal("insert", qualified, data);
+    // O-1: 二进制 payload (rowid + row), no json
+    jiamiao::InsertPayload ip;
+    ip.rowid = id;
+    ip.row = validated;
+    write_wal(WalOp::kInsert, qualified, jiamiao::wal_encode_insert(ip));
 
     // Phase 1 LSM: insert → MemTable::put
     TupleHeader hdr = header_from_row(qualified, id, validated);
@@ -519,23 +478,7 @@ int64_t StorageEngine::update(const std::string& table, std::function<bool(const
     for (auto& row : all_rows) {
         if (!match(row)) continue;
 
-        json upd_json;
-        for (const auto& [k, v] : updates) {
-            std::visit([&](auto&& val) {
-                using T = std::decay_t<decltype(val)>;
-                if constexpr (std::is_same_v<T, std::nullptr_t>) upd_json[k] = nullptr;
-                else if constexpr (std::is_same_v<T, int64_t>) upd_json[k] = val;
-                else if constexpr (std::is_same_v<T, double>) upd_json[k] = val;
-                else if constexpr (std::is_same_v<T, bool>) upd_json[k] = val;
-                else if constexpr (std::is_same_v<T, std::string>) upd_json[k] = val;
-            }, v);
-        }
-
         int64_t rowid = std::get<int64_t>(row.at("_rowid"));
-        json data;
-        data["rowid"] = rowid;
-        data["updates"] = upd_json;
-        write_wal("update", qualified, data);
 
         // 写新版本: 系统列保持 0/0/0 (非事务), 业务列用 updates 覆盖.
         // 擦除旧版本再 put, 与原 in-place 行为等价.
@@ -544,6 +487,16 @@ int64_t StorageEngine::update(const std::string& table, std::function<bool(const
         }
         row["_xmax"] = static_cast<int64_t>(0);
         row["_cid"]  = static_cast<int64_t>(0);
+
+        // O-1: 二进制 payload (rowid + updates + new_row)
+        jiamiao::UpdatePayload up;
+        up.rowid = rowid;
+        for (const auto& [k, v] : updates) {
+            up.updates[k] = v;
+        }
+        up.new_row = row;
+        write_wal(WalOp::kUpdate, qualified, jiamiao::wal_encode_update(up));
+
         rows_it->second->erase_all_for(rowid);
         TupleHeader hdr = header_from_row(qualified, rowid, row);
         auto tup = BinaryRowCodec::row_to_tuple(row, hdr);
@@ -572,9 +525,11 @@ int64_t StorageEngine::remove(const std::string& table, std::function<bool(const
     for (const auto& row : all_rows) {
         if (!match(row)) continue;
         int64_t rowid = std::get<int64_t>(row.at("_rowid"));
-        json data;
-        data["rowid"] = rowid;
-        write_wal("delete", qualified, data);
+        // O-1: 二进制 payload (rowid, has_xmax=false → 物理删除)
+        jiamiao::DeletePayload dp;
+        dp.rowid = rowid;
+        dp.has_xmax = false;
+        write_wal(WalOp::kDelete, qualified, jiamiao::wal_encode_delete(dp));
         to_delete.push_back(rowid);
     }
 
@@ -658,22 +613,11 @@ Row StorageEngine::insert_with_txn(const std::string& table, const Row& row) {
     txn_mgr_->add_undo_record(jiamiao::UndoRecord(
         jiamiao::UndoOp::INSERT, qualified, id, {}, validated));
 
-    // WAL
-    json row_json;
-    for (const auto& [k, v] : validated) {
-        std::visit([&](auto&& val) {
-            using T = std::decay_t<decltype(val)>;
-            if constexpr (std::is_same_v<T, std::nullptr_t>) row_json[k] = nullptr;
-            else if constexpr (std::is_same_v<T, int64_t>) row_json[k] = val;
-            else if constexpr (std::is_same_v<T, double>) row_json[k] = val;
-            else if constexpr (std::is_same_v<T, bool>) row_json[k] = val;
-            else if constexpr (std::is_same_v<T, std::string>) row_json[k] = val;
-        }, v);
-    }
-    json data;
-    data["row"] = row_json;
-    data["rowid"] = id;
-    write_wal("insert", qualified, data, xid);
+    // O-1: WAL 二进制 payload (rowid + row); xid 在 WALRecordV3.xid
+    jiamiao::InsertPayload ip;
+    ip.rowid = id;
+    ip.row = validated;
+    write_wal(WalOp::kInsert, qualified, jiamiao::wal_encode_insert(ip), xid);
 
     // Phase 1: insert → MemTable::put. 系统列已在 validated 中 (_xmin=xid, _xmax=0, _cid=cid)
     TupleHeader hdr = header_from_row(qualified, id, validated);
@@ -758,37 +702,14 @@ int64_t StorageEngine::update_with_txn(const std::string& table,
             txn_mgr_->add_undo_record(jiamiao::UndoRecord(
                 jiamiao::UndoOp::UPDATE, qualified, rowid, old_row, new_row));
 
-            // 3. WAL
-            json upd_json;
+            // 3. O-1: WAL 二进制 payload (rowid + updates + new_row); xid 在 WALRecordV3.xid
+            jiamiao::UpdatePayload up;
+            up.rowid = rowid;
             for (const auto& [k, v] : updates) {
-                std::visit([&](auto&& val) {
-                    using T = std::decay_t<decltype(val)>;
-                    if constexpr (std::is_same_v<T, std::nullptr_t>) upd_json[k] = nullptr;
-                    else if constexpr (std::is_same_v<T, int64_t>) upd_json[k] = val;
-                    else if constexpr (std::is_same_v<T, double>) upd_json[k] = val;
-                    else if constexpr (std::is_same_v<T, bool>) upd_json[k] = val;
-                    else if constexpr (std::is_same_v<T, std::string>) upd_json[k] = val;
-                }, v);
+                up.updates[k] = v;
             }
-
-            // 序列化新行
-            json new_row_json;
-            for (const auto& [k, v] : new_row) {
-                std::visit([&](auto&& val) {
-                    using T = std::decay_t<decltype(val)>;
-                    if constexpr (std::is_same_v<T, std::nullptr_t>) new_row_json[k] = nullptr;
-                    else if constexpr (std::is_same_v<T, int64_t>) new_row_json[k] = val;
-                    else if constexpr (std::is_same_v<T, double>) new_row_json[k] = val;
-                    else if constexpr (std::is_same_v<T, bool>) new_row_json[k] = val;
-                    else if constexpr (std::is_same_v<T, std::string>) new_row_json[k] = val;
-                }, v);
-            }
-
-            json data;
-            data["rowid"] = rowid;
-            data["updates"] = upd_json;
-            data["new_row"] = new_row_json;
-            write_wal("update", qualified, data, xid);
+            up.new_row = new_row;
+            write_wal(WalOp::kUpdate, qualified, jiamiao::wal_encode_update(up), xid);
 
             // 4. 物理操作 MemTable: 擦除旧版本 + 写新版本. 与原 in-place 行为等价:
             //    旧版本在 MemTable 中不再存在 (原行为是 row._xmax=xid), 扫描时仅新版本可见.
@@ -856,11 +777,12 @@ int64_t StorageEngine::remove_with_txn(const std::string& table,
             auto tombstone_tup = BinaryRowCodec::row_to_tuple(tombstone_row, hdr);
             rows_it->second->put(rowid, tombstone_tup, ++wal_seq_);
 
-            // WAL
-            json data;
-            data["rowid"] = rowid;
-            data["xmax"]  = static_cast<int64_t>(xid);
-            write_wal("delete", qualified, data, xid);
+            // O-1: WAL 二进制 payload (rowid + xmax); xid 在 WALRecordV3.xid
+            jiamiao::DeletePayload dp;
+            dp.rowid = rowid;
+            dp.has_xmax = true;
+            dp.xmax = static_cast<uint32_t>(xid);
+            write_wal(WalOp::kDelete, qualified, jiamiao::wal_encode_delete(dp), xid);
 
             count++;
         }
@@ -937,17 +859,15 @@ void StorageEngine::apply_undo_to(size_t count) {
 void StorageEngine::write_xact_commit(jiamiao::TransactionId xid) {
     auto h = mgr_.acquire(next_call_xid(),
                           {LockTargetType::Table, kWalTarget}, LockMode::Exclusive);
-    json data;
-    data["_xid"] = static_cast<int64_t>(xid);
-    write_wal("xact_commit", "", data, xid);
+    // O-1: payload 为空, xid 在 WALRecordV3.xid
+    write_wal(WalOp::kXactCommit, "", jiamiao::wal_encode_empty(), xid);
 }
 
 void StorageEngine::write_xact_abort(jiamiao::TransactionId xid) {
     auto h = mgr_.acquire(next_call_xid(),
                           {LockTargetType::Table, kWalTarget}, LockMode::Exclusive);
-    json data;
-    data["_xid"] = static_cast<int64_t>(xid);
-    write_wal("xact_abort", "", data, xid);
+    // O-1: payload 为空, xid 在 WALRecordV3.xid
+    write_wal(WalOp::kXactAbort, "", jiamiao::wal_encode_empty(), xid);
 }
 
 int64_t StorageEngine::vacuum() {
@@ -1162,245 +1082,173 @@ void StorageEngine::create_index(const std::string& table, const std::string& co
 
 /* ─── 内部 ─── */
 
-void StorageEngine::replay_record(const WALRecord& rec) {
-    // Catalog 操作
-    if (rec.op == "create_database") {
-        std::string db_name = rec.data["name"].get_string();
-        if (!catalog_->database_exists(db_name)) {
-            catalog_->create_database(db_name);
-        }
-        return;
-    }
-    if (rec.op == "drop_database") {
-        std::string db_name = rec.data["name"].get_string();
-        if (catalog_->database_exists(db_name)) {
-            catalog_->drop_database(db_name);
-        }
-        return;
-    }
-    if (rec.op == "create_schema") {
-        std::string db_name = rec.data["database"].get_string();
-        std::string schema_name = rec.data["schema"].get_string();
-        if (!catalog_->schema_exists(db_name, schema_name)) {
-            catalog_->create_schema(db_name, schema_name);
-        }
-        return;
-    }
-    if (rec.op == "create_user") {
-        std::string user_name = rec.data["name"].get_string();
-        if (!catalog_->user_exists(user_name)) {
-            // 重放时不恢复密码 (密码已通过 checkpoint 恢复)
-        }
-        return;
-    }
-    if (rec.op == "drop_user") {
-        std::string user_name = rec.data["name"].get_string();
-        if (catalog_->user_exists(user_name)) {
-            catalog_->drop_user(user_name);
-        }
-        return;
-    }
+void StorageEngine::replay_record(const WALRecordV3& rec) {
+    // O-1: 直接吃 v3 二进制 payload, 不再走 json::parse
+    // xid 在 rec.xid (0 表示无 xid); op 是 enum tag; table 是 qualified name.
+    const jiamiao::TransactionId rec_xid =
+        (rec.xid != 0) ? static_cast<jiamiao::TransactionId>(rec.xid)
+                       : jiamiao::InvalidTransactionId;
+    const auto op = static_cast<jiamiao::WalOp>(rec.op);
 
-    if (rec.op == "create_table") {
-        TableSchema schema;
-        schema.name = rec.table;
-        schema.row_count = 0;
-        for (const auto& c : rec.data["columns"]) {
-            ColumnDef col;
-            col.name = c["name"].get_string();
-            col.type = data_type_from_name(c.value("type", std::string("TEXT")));
-            col.nullable = c.value("nullable", true);
-            col.primary_key = c.value("primary_key", false);
-            schema.columns.push_back(col);
-        }
-        tables_[rec.table] = std::move(schema);
-        data_[rec.table] = std::make_unique<MemTable>(rec.table);
-        row_ids_[rec.table] = 0;
-        indexes_[rec.table] = {};
-
-        for (const auto& c : tables_[rec.table].columns) {
-            if (c.primary_key) create_index(rec.table, c.name);
-        }
-        return;
-    }
-
-    if (rec.op == "drop_table") {
-        tables_.erase(rec.table);
-        data_.erase(rec.table);
-        row_ids_.erase(rec.table);
-        indexes_.erase(rec.table);
-        return;
-    }
-
-    if (rec.op == "xact_commit") {
-        if (rec.data.contains("_xid")) {
-            jiamiao::TransactionId xid = static_cast<jiamiao::TransactionId>(
-                rec.data["_xid"].get_int());
-            txn_mgr_->clog().set_status(xid, jiamiao::TransactionStatus::COMMITTED);
-        }
-        return;
-    }
-
-    if (rec.op == "xact_abort") {
-        if (rec.data.contains("_xid")) {
-            jiamiao::TransactionId xid = static_cast<jiamiao::TransactionId>(
-                rec.data["_xid"].get_int());
-            txn_mgr_->clog().set_status(xid, jiamiao::TransactionStatus::ABORTED);
-        }
-        return;
-    }
-
-    if (rec.op == "insert") {
-        // 事务过滤: 跳过未提交或已回滚的记录
-        if (rec.data.contains("_xid")) {
-            jiamiao::TransactionId xid = static_cast<jiamiao::TransactionId>(
-                rec.data["_xid"].get_int());
-            auto status = txn_mgr_->clog().get_status(xid);
-            if (status != jiamiao::TransactionStatus::COMMITTED) return;
-        }
-
-        auto mt_it = data_.find(rec.table);
-        if (mt_it == data_.end()) {
-            // 表还没创建 (checkpoint 还没载完, create_table 还没 replay) — 跳过
+    // Catalog 操作 (payload 为空 / 简短)
+    switch (op) {
+        case jiamiao::WalOp::kCreateDatabase: {
+            if (!catalog_->database_exists(rec.table)) {
+                catalog_->create_database(rec.table);
+            }
             return;
         }
-        auto& mt = mt_it->second;
-
-        Row row;
-        for (auto it = rec.data["row"].obj_begin(); it != rec.data["row"].obj_end(); ++it) {
-            const auto& v = it->second;
-            if (v.is_null()) row[it->first] = nullptr;
-            else if (v.is_int()) row[it->first] = v.get_int();
-            else if (v.is_float()) row[it->first] = v.get_float();
-            else if (v.is_bool()) row[it->first] = v.get_bool();
-            else row[it->first] = v.get_string();
-        }
-        int64_t rid = 0;
-        if (rec.data.contains("rowid")) {
-            rid = rec.data["rowid"].get_int();
-        } else {
-            auto rit = row.find("_rowid");
-            if (rit != row.end()) {
-                if (auto* v = std::get_if<int64_t>(&rit->second)) rid = *v;
+        case jiamiao::WalOp::kDropDatabase: {
+            if (catalog_->database_exists(rec.table)) {
+                catalog_->drop_database(rec.table);
             }
+            return;
         }
-
-        // Phase 1: insert → put. 系统列从 row 中取 (xmin/xmax/cid)
-        TupleHeader hdr = header_from_row(rec.table, rid, row);
-        auto tup = BinaryRowCodec::row_to_tuple(row, hdr);
-        mt->put(rid, tup, ++wal_seq_);
-        update_indexes(rec.table, rid, row);
-
-        auto schema_it = tables_.find(rec.table);
-        if (schema_it != tables_.end()) schema_it->second.row_count = static_cast<int64_t>(mt->size());
-
-        if (rec.data.contains("rowid")) {
-            row_ids_[rec.table] = std::max(row_ids_[rec.table], rec.data["rowid"].get_int());
-        }
-        return;
-    }
-
-    if (rec.op == "update") {
-        // 事务过滤
-        if (rec.data.contains("_xid")) {
-            jiamiao::TransactionId xid = static_cast<jiamiao::TransactionId>(
-                rec.data["_xid"].get_int());
-            auto status = txn_mgr_->clog().get_status(xid);
-            if (status != jiamiao::TransactionStatus::COMMITTED) return;
-        }
-
-        auto rows_it = data_.find(rec.table);
-        if (rows_it == data_.end()) return;
-        auto& mt = rows_it->second;
-
-        int64_t rowid = rec.data["rowid"].get_int();
-        jiamiao::TransactionId xid = rec.data.contains("_xid")
-            ? static_cast<jiamiao::TransactionId>(rec.data["_xid"].get_int())
-            : jiamiao::InvalidTransactionId;
-
-        // 从 WAL 恢复新行版本
-        if (rec.data.contains("new_row")) {
-            Row new_row;
-            for (auto it = rec.data["new_row"].obj_begin();
-                 it != rec.data["new_row"].obj_end(); ++it) {
-                const auto& v = it->second;
-                if (v.is_null()) new_row[it->first] = nullptr;
-                else if (v.is_int()) new_row[it->first] = v.get_int();
-                else if (v.is_float()) new_row[it->first] = v.get_float();
-                else if (v.is_bool()) new_row[it->first] = v.get_bool();
-                else new_row[it->first] = v.get_string();
+        case jiamiao::WalOp::kCreateSchema: {
+            jiamiao::CreateSchemaPayload p;
+            if (!jiamiao::wal_decode_create_schema(rec.data, &p)) return;
+            if (!catalog_->schema_exists(rec.table, p.schema)) {
+                catalog_->create_schema(rec.table, p.schema);
             }
-            // Phase 1: put 新版本. 旧版本保留 (_xmax=0, 不可见需靠 scan_with_snapshot 过滤)
-            (void)xid;  // Phase 1: 旧版本标记 _xmax 需要新写一个版本, 暂略 (与 update_with_txn 同样的限制)
-            TupleHeader hdr = header_from_row(rec.table, rowid, new_row);
-            auto tup = BinaryRowCodec::row_to_tuple(new_row, hdr);
-            mt->put(rowid, tup, ++wal_seq_);
-        } else {
-            // 兼容旧格式 (无 new_row): 原地更新
-            std::map<std::string, Value> updates;
-            for (auto it = rec.data["updates"].obj_begin();
-                 it != rec.data["updates"].obj_end(); ++it) {
-                const auto& v = it->second;
-                if (v.is_null()) updates[it->first] = nullptr;
-                else if (v.is_int()) updates[it->first] = v.get_int();
-                else if (v.is_float()) updates[it->first] = v.get_float();
-                else if (v.is_bool()) updates[it->first] = v.get_bool();
-                else updates[it->first] = v.get_string();
+            return;
+        }
+        case jiamiao::WalOp::kCreateUser: {
+            // 重放时不恢复密码 (密码已通过 checkpoint 恢复). 仅占位.
+            return;
+        }
+        case jiamiao::WalOp::kDropUser: {
+            if (catalog_->user_exists(rec.table)) {
+                catalog_->drop_user(rec.table);
             }
-            // 取最新版本, 应用 updates, put
-            auto opt = mt->get_latest(rowid);
-            if (opt) {
-                Row row = tuple_to_row_for_visibility(*opt);
-                for (const auto& [k, v] : updates) row[k] = v;
-                TupleHeader hdr = header_from_row(rec.table, rowid, row);
-                auto tup = BinaryRowCodec::row_to_tuple(row, hdr);
-                mt->put(rowid, tup, ++wal_seq_);
-            }
-            if (updates_affect_index(rec.table, updates)) rebuild_indexes(rec.table);
+            return;
         }
 
-        rebuild_indexes(rec.table);
-        auto schema_it = tables_.find(rec.table);
-        if (schema_it != tables_.end()) schema_it->second.row_count = static_cast<int64_t>(mt->size());
-        return;
-    }
+        case jiamiao::WalOp::kCreateTable: {
+            jiamiao::CreateTablePayload p;
+            if (!jiamiao::wal_decode_create_table(rec.data, &p)) return;
+            TableSchema schema;
+            schema.name = rec.table;
+            schema.row_count = 0;
+            schema.columns = std::move(p.columns);
+            tables_[rec.table] = std::move(schema);
+            data_[rec.table] = std::make_unique<MemTable>(rec.table);
+            row_ids_[rec.table] = 0;
+            indexes_[rec.table] = {};
 
-    if (rec.op == "delete") {
-        // 事务过滤
-        if (rec.data.contains("_xid")) {
-            jiamiao::TransactionId xid = static_cast<jiamiao::TransactionId>(
-                rec.data["_xid"].get_int());
-            auto status = txn_mgr_->clog().get_status(xid);
-            if (status != jiamiao::TransactionStatus::COMMITTED) return;
+            for (const auto& c : tables_[rec.table].columns) {
+                if (c.primary_key) create_index(rec.table, c.name);
+            }
+            return;
         }
 
-        auto rows_it = data_.find(rec.table);
-        if (rows_it == data_.end()) return;
-        auto& mt = rows_it->second;
+        case jiamiao::WalOp::kDropTable: {
+            tables_.erase(rec.table);
+            data_.erase(rec.table);
+            row_ids_.erase(rec.table);
+            indexes_.erase(rec.table);
+            return;
+        }
 
-        int64_t rowid = rec.data["rowid"].get_int();
-        jiamiao::TransactionId xmax_val = rec.data.contains("xmax")
-            ? static_cast<jiamiao::TransactionId>(rec.data["xmax"].get_int())
-            : jiamiao::InvalidTransactionId;
-
-        if (xmax_val != jiamiao::InvalidTransactionId) {
-            // MVCC 格式: 写 tombstone 版本 (xmax=xmax_val)
-            auto opt = mt->get_latest(rowid);
-            if (opt) {
-                Row row = tuple_to_row_for_visibility(*opt);
-                row["_xmax"] = static_cast<int64_t>(xmax_val);
-                TupleHeader hdr = header_from_row(rec.table, rowid, row);
-                auto tup = BinaryRowCodec::row_to_tuple(row, hdr);
-                mt->put(rowid, tup, ++wal_seq_);
+        case jiamiao::WalOp::kXactCommit: {
+            if (rec_xid != jiamiao::InvalidTransactionId) {
+                txn_mgr_->clog().set_status(rec_xid, jiamiao::TransactionStatus::COMMITTED);
             }
-        } else {
-            // 兼容旧格式: 物理删除
-            mt->erase_all_for(rowid);
+            return;
+        }
+        case jiamiao::WalOp::kXactAbort: {
+            if (rec_xid != jiamiao::InvalidTransactionId) {
+                txn_mgr_->clog().set_status(rec_xid, jiamiao::TransactionStatus::ABORTED);
+            }
+            return;
+        }
+
+        case jiamiao::WalOp::kInsert: {
+            // 事务过滤: 跳过未提交或已回滚的记录
+            if (rec_xid != jiamiao::InvalidTransactionId) {
+                auto status = txn_mgr_->clog().get_status(rec_xid);
+                if (status != jiamiao::TransactionStatus::COMMITTED) return;
+            }
+            auto mt_it = data_.find(rec.table);
+            if (mt_it == data_.end()) return;  // 表还没 create_table replay 到
+            auto& mt = mt_it->second;
+
+            jiamiao::InsertPayload p;
+            if (!jiamiao::wal_decode_insert(rec.data, &p)) return;
+
+            TupleHeader hdr = header_from_row(rec.table, p.rowid, p.row);
+            auto tup = BinaryRowCodec::row_to_tuple(p.row, hdr);
+            mt->put(p.rowid, tup, ++wal_seq_);
+            update_indexes(rec.table, p.rowid, p.row);
+
+            auto schema_it = tables_.find(rec.table);
+            if (schema_it != tables_.end())
+                schema_it->second.row_count = static_cast<int64_t>(mt->size());
+
+            row_ids_[rec.table] = std::max(row_ids_[rec.table], p.rowid);
+            return;
+        }
+
+        case jiamiao::WalOp::kUpdate: {
+            if (rec_xid != jiamiao::InvalidTransactionId) {
+                auto status = txn_mgr_->clog().get_status(rec_xid);
+                if (status != jiamiao::TransactionStatus::COMMITTED) return;
+            }
+            auto rows_it = data_.find(rec.table);
+            if (rows_it == data_.end()) return;
+            auto& mt = rows_it->second;
+
+            jiamiao::UpdatePayload p;
+            if (!jiamiao::wal_decode_update(rec.data, &p)) return;
+
+            // O-1: 总是有 new_row, put 新版本 (旧版本保留, MVCC 由 scan_with_snapshot 过滤)
+            TupleHeader hdr = header_from_row(rec.table, p.rowid, p.new_row);
+            auto tup = BinaryRowCodec::row_to_tuple(p.new_row, hdr);
+            mt->put(p.rowid, tup, ++wal_seq_);
+
+            if (updates_affect_index(rec.table, p.updates)) rebuild_indexes(rec.table);
             rebuild_indexes(rec.table);
             auto schema_it = tables_.find(rec.table);
-            if (schema_it != tables_.end()) schema_it->second.row_count = static_cast<int64_t>(mt->size());
+            if (schema_it != tables_.end())
+                schema_it->second.row_count = static_cast<int64_t>(mt->size());
+            return;
         }
-        return;
+
+        case jiamiao::WalOp::kDelete: {
+            if (rec_xid != jiamiao::InvalidTransactionId) {
+                auto status = txn_mgr_->clog().get_status(rec_xid);
+                if (status != jiamiao::TransactionStatus::COMMITTED) return;
+            }
+            auto rows_it = data_.find(rec.table);
+            if (rows_it == data_.end()) return;
+            auto& mt = rows_it->second;
+
+            jiamiao::DeletePayload p;
+            if (!jiamiao::wal_decode_delete(rec.data, &p)) return;
+
+            if (p.has_xmax) {
+                // MVCC tombstone: 取最新版本, 标 _xmax, put 回去
+                auto opt = mt->get_latest(p.rowid);
+                if (opt) {
+                    Row row = tuple_to_row_for_visibility(*opt);
+                    row["_xmax"] = static_cast<int64_t>(p.xmax);
+                    TupleHeader hdr = header_from_row(rec.table, p.rowid, row);
+                    auto tup = BinaryRowCodec::row_to_tuple(row, hdr);
+                    mt->put(p.rowid, tup, ++wal_seq_);
+                }
+            } else {
+                // 物理删除
+                mt->erase_all_for(p.rowid);
+                rebuild_indexes(rec.table);
+                auto schema_it = tables_.find(rec.table);
+                if (schema_it != tables_.end())
+                    schema_it->second.row_count = static_cast<int64_t>(mt->size());
+            }
+            return;
+        }
+
+        case jiamiao::WalOp::kUnknown:
+        default:
+            return;
     }
 }
 
@@ -1426,55 +1274,39 @@ void StorageEngine::checkpoint() {
     for (const auto& [name, schema] : tables_) {
         ckp.tables.push_back(schema);
 
-        json rows_json = json::array();
+        // O-2: 强类型 table_rows, 无 JSON 中间层
+        auto& rows = ckp.table_rows[name];
         auto data_it = data_.find(name);
         if (data_it != data_.end()) {
             auto all = data_it->second->scan_all();
             for (const auto& tup : all) {
                 Row row = tuple_to_row_for_visibility(tup);
-                json r;
-                for (const auto& [k, v] : row) {
-                    std::visit([&](auto&& val) {
-                        using T = std::decay_t<decltype(val)>;
-                        if constexpr (std::is_same_v<T, std::nullptr_t>) r[k] = nullptr;
-                        else if constexpr (std::is_same_v<T, int64_t>) r[k] = val;
-                        else if constexpr (std::is_same_v<T, double>) r[k] = val;
-                        else if constexpr (std::is_same_v<T, bool>) r[k] = val;
-                        else if constexpr (std::is_same_v<T, std::string>) r[k] = val;
-                    }, v);
+                int64_t rid = 0;
+                auto rid_it = row.find("_rowid");
+                if (rid_it != row.end()) {
+                    if (auto* v = std::get_if<int64_t>(&rid_it->second)) rid = *v;
                 }
-                rows_json.push_back(r);
+                rows.emplace_back(rid, std::move(row));
             }
         }
-        ckp.table_data[name] = rows_json;
         ckp.row_id_counters[name] = row_ids_[name];
 
-        // 序列化索引
-        json idx_arr = json::array();
+        // O-2: 强类型 indexes_data, 无 JSON 中间层
         auto idx_it = indexes_.find(name);
         if (idx_it != indexes_.end()) {
-            for (const auto& idx : idx_it->second) {
-                json ij;
-                ij["column"] = idx.column;
-                json entries;
-                for (const auto& [k, indices] : idx.entries) {
-                    json arr = json::array();
-                    for (int64_t v : indices) arr.push_back(v);
-                    entries[k] = arr;
-                }
-                ij["entries"] = entries;
-                idx_arr.push_back(ij);
-            }
+            ckp.indexes_data[name] = idx_it->second;
         }
-        ckp.indexes[name] = idx_arr;
     }
 
     // 序列化事务状态: next_xid + CLog (含 SSI 状态)
     ckp.next_xid = txn_mgr_->get_next_xid();
-    ckp.clog_entries = txn_mgr_->clog().to_json();
+    // O-4: 改为 binary CLog (clog_encode)
+    ckp.clog_bytes = jiamiao::clog_encode(txn_mgr_->clog());
+    ckp.clog_entries = json(nullptr);  // 显式清空 JSON 兜底
 
-    // 序列化 Catalog
-    ckp.catalog_data = catalog_->to_json();
+    // O-3: 序列化 Catalog 为二进制
+    ckp.catalog_bytes = jiamiao::catalog_encode(*catalog_);
+    ckp.catalog_data = json(nullptr);  // 清掉旧字段
 
     // 写入 checkpoint
     ckp_mgr_->save(ckp);
@@ -1597,22 +1429,19 @@ int64_t StorageEngine::next_seq() {
     return ++wal_seq_;
 }
 
-void StorageEngine::write_wal(const std::string& op, const std::string& table,
-                               const json& data, jiamiao::TransactionId xid) {
+void StorageEngine::write_wal(jiamiao::WalOp op, const std::string& table,
+                               std::string payload, jiamiao::TransactionId xid) {
     int64_t seq = next_seq();
-    json enriched = data;
-    if (xid != jiamiao::InvalidTransactionId) {
-        enriched["_xid"] = static_cast<int64_t>(xid);
-    }
+    // O-1: payload 已是二进制 bytes; xid 直接放 WALRecordV3.xid (header), 不再嵌入 payload.
     // Phase 3: encode() 的 byte buffer 走 jmalloc (WALContext).
     // 出 scope 时 buffer 整体 reset, 实际字节已 write 到 fd.
     jiamiao::ScopeContext wal_scope(wal_ctx_);
     jiamiao::WALRecordV3 rec;
     rec.seq       = seq;
     rec.timestamp = time(nullptr);
-    rec.op        = jiamiao::op_to_enum(op);
+    rec.op        = static_cast<uint16_t>(op);
     rec.table     = table;
     rec.xid       = (xid != jiamiao::InvalidTransactionId) ? static_cast<uint32_t>(xid) : 0u;
-    rec.data      = enriched.dump();
+    rec.data      = std::move(payload);
     wal_->append(rec);
 }

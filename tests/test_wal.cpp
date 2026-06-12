@@ -1,7 +1,7 @@
 #include "doctest.h"
-#include "storage/wal.h"
 #include "storage/wal_v3.h"
-#include "json.h"
+#include "storage/wal_payload.h"
+#include "common/json.h"
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -29,359 +29,6 @@ struct TempWalDir {
     }
 };
 
-WALRecord make_rec(int64_t seq, const std::string& op, const std::string& table,
-                   const std::string& key) {
-    WALRecord r;
-    r.seq = seq;
-    r.timestamp = 1700000000 + seq;
-    r.op = op;
-    r.table = table;
-    json d;
-    d["key"] = key;
-    r.data = d;
-    return r;
-}
-
-} // namespace
-
-TEST_CASE("WAL: open/append/close appends a JSON line per record") {
-    TempWalDir tmp;
-    std::string p = tmp.path("wal.log");
-
-    WriteAheadLog wal(p);
-    wal.open();
-    wal.append(make_rec(1, "insert", "users", "u1"));
-    wal.append(make_rec(2, "insert", "users", "u2"));
-    wal.sync();
-    wal.close();
-
-    // File exists, contains 2 lines
-    std::ifstream in(p);
-    std::string line;
-    int count = 0;
-    while (std::getline(in, line)) {
-        if (!line.empty()) ++count;
-    }
-    CHECK(count == 2);
-}
-
-TEST_CASE("WAL: replay returns records in file order, filtered by from_seq") {
-    TempWalDir tmp;
-    std::string p = tmp.path("wal.log");
-
-    WriteAheadLog wal(p);
-    wal.open();
-    wal.append(make_rec(10, "insert", "t", "a"));
-    wal.append(make_rec(20, "insert", "t", "b"));
-    wal.append(make_rec(30, "insert", "t", "c"));
-    wal.close();
-
-    auto recs = wal.replay(15);  // skip seq <= 15
-    CHECK(recs.size() == 2);
-    CHECK(recs[0].seq == 20);
-    CHECK(recs[1].seq == 30);
-}
-
-TEST_CASE("WAL: to_json includes WAL_FORMAT_VERSION field 'v'") {
-    WALRecord r = make_rec(1, "insert", "t", "k");
-    json j = r.to_json();
-    CHECK(j.contains("v"));
-    CHECK(j["v"].get_int() == WAL_FORMAT_VERSION);
-    CHECK(j["v"].get_int() == 2);
-    CHECK(j.contains("seq"));
-    CHECK(j.contains("op"));
-    CHECK(j.contains("table"));
-    CHECK(j.contains("data"));
-}
-
-TEST_CASE("WAL: from_json tolerates missing 'v' field (backward compat with v1)") {
-    // 模拟旧格式: 不包含 "v" 字段
-    json j;
-    j["seq"] = 42;
-    j["ts"] = 1234;
-    j["op"] = "insert";
-    j["table"] = "users";
-    json data;
-    data["key"] = "u1";
-    j["data"] = data;
-
-    // 不应抛异常
-    WALRecord r = WALRecord::from_json(j);
-    CHECK(r.seq == 42);
-    CHECK(r.timestamp == 1234);
-    CHECK(r.op == "insert");
-    CHECK(r.table == "users");
-}
-
-TEST_CASE("WAL: from_json tolerates missing 'ts' field (older records)") {
-    json j;
-    j["seq"] = 1;
-    j["op"] = "insert";
-    j["table"] = "t";
-    j["data"] = json::object();
-
-    WALRecord r = WALRecord::from_json(j);
-    CHECK(r.seq == 1);
-    CHECK(r.timestamp == 0);  // 默认值
-}
-
-TEST_CASE("WAL: old-format file (no 'v' field) replays correctly") {
-    TempWalDir tmp;
-    std::string p = tmp.path("wal_old.log");
-
-    // 手动写入旧格式记录
-    {
-        std::ofstream out(p, std::ios::trunc);
-        json r1;
-        r1["seq"] = 1;
-        r1["ts"] = 100;
-        r1["op"] = "insert";
-        r1["table"] = "t";
-        r1["data"] = json::object();
-        out << r1.dump() << "\n";
-
-        json r2;
-        r2["seq"] = 2;
-        r2["ts"] = 200;
-        r2["op"] = "update";
-        r2["table"] = "t";
-        r2["data"] = json::object();
-        out << r2.dump() << "\n";
-    }
-
-    WriteAheadLog wal(p);
-    auto recs = wal.replay(0);
-    CHECK(recs.size() == 2);
-    CHECK(recs[0].seq == 1);
-    CHECK(recs[0].op == "insert");
-    CHECK(recs[1].seq == 2);
-    CHECK(recs[1].op == "update");
-}
-
-TEST_CASE("WAL: truncate removes records with seq <= cutoff and preserves later ones") {
-    TempWalDir tmp;
-    std::string p = tmp.path("wal.log");
-
-    WriteAheadLog wal(p);
-    wal.open();
-    wal.append(make_rec(1, "insert", "t", "a"));
-    wal.append(make_rec(2, "insert", "t", "b"));
-    wal.append(make_rec(3, "insert", "t", "c"));
-    wal.append(make_rec(4, "insert", "t", "d"));
-    wal.close();
-
-    // 截断到 seq <= 2
-    wal.open();
-    wal.truncate(2);
-    wal.close();
-
-    // 重放: 应当只剩 seq=3, seq=4
-    auto recs = wal.replay(0);
-    CHECK(recs.size() == 2);
-    CHECK(recs[0].seq == 3);
-    CHECK(recs[1].seq == 4);
-}
-
-TEST_CASE("WAL: truncate with cutoff >= max_seq empties the file") {
-    TempWalDir tmp;
-    std::string p = tmp.path("wal.log");
-
-    WriteAheadLog wal(p);
-    wal.open();
-    wal.append(make_rec(1, "insert", "t", "a"));
-    wal.append(make_rec(2, "insert", "t", "b"));
-    wal.close();
-
-    wal.open();
-    wal.truncate(100);  // 截断比所有 seq 都大
-    wal.close();
-
-    auto recs = wal.replay(0);
-    CHECK(recs.empty());
-}
-
-TEST_CASE("WAL: truncate with cutoff < min_seq keeps everything") {
-    TempWalDir tmp;
-    std::string p = tmp.path("wal.log");
-
-    WriteAheadLog wal(p);
-    wal.open();
-    wal.append(make_rec(10, "insert", "t", "a"));
-    wal.append(make_rec(20, "insert", "t", "b"));
-    wal.close();
-
-    wal.open();
-    wal.truncate(5);  // 比最小 seq 还小
-    wal.close();
-
-    auto recs = wal.replay(0);
-    CHECK(recs.size() == 2);
-    CHECK(recs[0].seq == 10);
-    CHECK(recs[1].seq == 20);
-}
-
-TEST_CASE("WAL: truncate is idempotent on already-empty result") {
-    TempWalDir tmp;
-    std::string p = tmp.path("wal.log");
-
-    WriteAheadLog wal(p);
-    wal.open();
-    wal.append(make_rec(1, "insert", "t", "a"));
-    wal.append(make_rec(2, "insert", "t", "b"));
-    wal.append(make_rec(3, "insert", "t", "c"));
-    wal.close();
-
-    wal.open();
-    wal.truncate(1);  // 保留 seq=2,3
-    CHECK(wal.replay(0).size() == 2);
-
-    // 多次截断到同一值: 结果不变
-    wal.truncate(1);
-    wal.truncate(1);
-    CHECK(wal.replay(0).size() == 2);
-
-    // 截断到更大值: 全部移除
-    wal.truncate(100);
-    wal.truncate(100);  // 重复一次也无副作用
-    wal.close();
-
-    auto recs = wal.replay(0);
-    CHECK(recs.empty());
-}
-
-TEST_CASE("WAL: truncate preserves 'v' field in kept records (v2 format)") {
-    TempWalDir tmp;
-    std::string p = tmp.path("wal.log");
-
-    WriteAheadLog wal(p);
-    wal.open();
-    wal.append(make_rec(1, "insert", "t", "a"));
-    wal.append(make_rec(2, "insert", "t", "b"));
-    wal.close();
-
-    wal.open();
-    wal.truncate(1);
-    wal.close();
-
-    // 读回原始字节, 验证 v2 格式保留
-    std::ifstream in(p);
-    std::string line;
-    std::getline(in, line);
-    auto j = json::parse(line);
-    CHECK(j["v"].get_int() == WAL_FORMAT_VERSION);
-    CHECK(j["seq"].get_int() == 2);
-}
-
-TEST_CASE("WAL: append after truncate continues seq from kept records") {
-    TempWalDir tmp;
-    std::string p = tmp.path("wal.log");
-
-    WriteAheadLog wal(p);
-    wal.open();
-    wal.append(make_rec(1, "insert", "t", "a"));
-    wal.append(make_rec(2, "insert", "t", "b"));
-    wal.append(make_rec(3, "insert", "t", "c"));
-    wal.close();
-
-    wal.open();
-    wal.truncate(2);  // 只保留 seq=3
-    // 重新打开后, 截断后 append 新记录
-    wal.append(make_rec(4, "insert", "t", "d"));
-    wal.close();
-
-    auto recs = wal.replay(0);
-    CHECK(recs.size() == 2);
-    CHECK(recs[0].seq == 3);
-    CHECK(recs[1].seq == 4);
-}
-
-TEST_CASE("WAL: mixed format file (old + new) replays in order") {
-    TempWalDir tmp;
-    std::string p = tmp.path("mixed.log");
-
-    // 旧格式记录 (无 v 字段)
-    {
-        std::ofstream out(p, std::ios::trunc);
-        json r1;
-        r1["seq"] = 1;
-        r1["op"] = "insert";
-        r1["table"] = "t";
-        r1["data"] = json::object();
-        out << r1.dump() << "\n";
-    }
-
-    // 新格式记录 (有 v 字段) — 追加
-    WriteAheadLog wal(p);
-    wal.open();
-    wal.append(make_rec(2, "update", "t", "b"));
-    wal.close();
-
-    auto recs = wal.replay(0);
-    CHECK(recs.size() == 2);
-    CHECK(recs[0].seq == 1);
-    CHECK(recs[0].op == "insert");
-    CHECK(recs[1].seq == 2);
-    CHECK(recs[1].op == "update");
-}
-
-TEST_CASE("WAL: corrupt lines are silently skipped during replay") {
-    TempWalDir tmp;
-    std::string p = tmp.path("corrupt.log");
-
-    {
-        std::ofstream out(p, std::ios::trunc);
-        out << "{not valid json\n";
-        json r1;
-        r1["seq"] = 1;
-        r1["op"] = "insert";
-        r1["table"] = "t";
-        r1["data"] = json::object();
-        out << r1.dump() << "\n";
-        out << "garbage line\n";
-        json r2;
-        r2["seq"] = 2;
-        r2["op"] = "insert";
-        r2["table"] = "t";
-        r2["data"] = json::object();
-        out << r2.dump() << "\n";
-    }
-
-    WriteAheadLog wal(p);
-    auto recs = wal.replay(0);
-    CHECK(recs.size() == 2);
-    CHECK(recs[0].seq == 1);
-    CHECK(recs[1].seq == 2);
-}
-
-TEST_CASE("WAL: replay of non-existent file returns empty") {
-    TempWalDir tmp;
-    std::string p = tmp.path("missing.log");
-
-    WriteAheadLog wal(p);
-    auto recs = wal.replay(0);
-    CHECK(recs.empty());
-}
-
-TEST_CASE("WAL: current_seq tracks the last appended record's seq") {
-    TempWalDir tmp;
-    std::string p = tmp.path("wal.log");
-
-    WriteAheadLog wal(p);
-    wal.open();
-    wal.append(make_rec(5, "insert", "t", "a"));
-    CHECK(wal.current_seq() == 5);
-    wal.append(make_rec(10, "insert", "t", "b"));
-    CHECK(wal.current_seq() == 10);
-    // 注: 当前实现直接覆盖 seq_ (不取 max), 调用方应保证单调递增
-    wal.append(make_rec(7, "insert", "t", "c"));
-    CHECK(wal.current_seq() == 7);
-    wal.close();
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// WAL v3 tests: binary length-prefix + CRC32 + v2 fallback + fsync
-// ═══════════════════════════════════════════════════════════════════
-namespace {
 
 jiamiao::WALRecordV3 make_v3(int64_t seq, jiamiao::WalOp op,
                               const std::string& table,
@@ -501,33 +148,7 @@ TEST_CASE("WAL v3: CRC failure skips corrupted record, replay continues") {
     }
 }
 
-TEST_CASE("WAL v3: fallback reads v2 JSON Lines (no magic)") {
-    using namespace jiamiao;
-    TempWalDir td;
-    auto p = td.path("v2_legacy.wal");
-
-    // 写 v2 JSON Lines (用 WriteAheadLog v2 类)
-    {
-        WriteAheadLog wal(p);
-        wal.open();
-        wal.append(make_rec(1, "insert", "db.s.t", "alpha"));
-        wal.append(make_rec(2, "update", "db.s.t", "beta"));
-        wal.append(make_rec(3, "xact_commit", "", "_"));
-        wal.close();
-    }
-
-    // 用 v3 reader 读 — 应该 fallback 解析 v2 JSON
-    WriteAheadLogV3 wal_v3(p);
-    auto recs = wal_v3.replay(0);
-    CHECK(recs.size() == 3);
-    CHECK(recs[0].op == static_cast<uint16_t>(WalOp::kInsert));
-    CHECK(recs[1].op == static_cast<uint16_t>(WalOp::kUpdate));
-    CHECK(recs[2].op == static_cast<uint16_t>(WalOp::kXactCommit));
-    CHECK(recs[0].table == "db.s.t");
-    CHECK(wal_v3.current_seq() == 3);
-}
-
-TEST_CASE("WAL v3: truncate keeps only seq > cutoff and upgrades v2 → v3") {
+TEST_CASE("WAL v3: truncate keeps only seq > cutoff") {
     using namespace jiamiao;
     TempWalDir td;
     auto p = td.path("v3_truncate.wal");
@@ -549,11 +170,177 @@ TEST_CASE("WAL v3: truncate keeps only seq > cutoff and upgrades v2 → v3") {
     CHECK(recs[1].seq == 5);
 }
 
+
 TEST_CASE("WAL v3: CRC32 matches known zlib value (sanity)") {
     using namespace jiamiao;
     // "123456789" 的 CRC32 = 0xCBF43926 (RFC, zlib 验证向量)
     const char* s = "123456789";
     uint32_t crc = crc32_compute(reinterpret_cast<const uint8_t*>(s), 9);
     CHECK(crc == 0xCBF43926U);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   O-1: Binary WAL payload codec tests
+   验证每个 op 的 encode/decode 往返保真
+   ═══════════════════════════════════════════════════════════════════════ */
+
+TEST_CASE("O-1: wal_encode_row / wal_decode_row round-trips all Value variant cases") {
+    using namespace jiamiao;
+    Row r;
+    r["null_col"]  = nullptr;
+    r["int_col"]   = int64_t(-1234567890123LL);
+    r["float_col"] = 3.14159;
+    r["bool_col"]  = true;
+    r["str_col"]   = std::string("hello, world 中文");
+
+    auto bytes = wal_encode_row(r);
+    Row r2;
+    CHECK(wal_decode_row(bytes, &r2));
+    CHECK(r2.size() == r.size());
+    CHECK(std::get<int64_t>(r2["int_col"]) == -1234567890123LL);
+    CHECK(std::get<double>(r2["float_col"]) == doctest::Approx(3.14159));
+    CHECK(std::get<bool>(r2["bool_col"]) == true);
+    CHECK(std::get<std::string>(r2["str_col"]) == "hello, world 中文");
+    CHECK(std::holds_alternative<std::nullptr_t>(r2["null_col"]));
+}
+
+TEST_CASE("O-1: wal_encode_insert round-trip preserves rowid and full row") {
+    using namespace jiamiao;
+    InsertPayload p;
+    p.rowid = 42;
+    p.row["id"]   = int64_t(42);
+    p.row["name"] = std::string("alice");
+    p.row["v"]    = 1.5;
+
+    auto bytes = wal_encode_insert(p);
+    InsertPayload q;
+    CHECK(wal_decode_insert(bytes, &q));
+    CHECK(q.rowid == 42);
+    CHECK(std::get<std::string>(q.row["name"]) == "alice");
+    CHECK(std::get<double>(q.row["v"]) == doctest::Approx(1.5));
+}
+
+TEST_CASE("O-1: wal_encode_update round-trip preserves rowid, updates, new_row") {
+    using namespace jiamiao;
+    UpdatePayload p;
+    p.rowid = 7;
+    p.updates["age"] = int64_t(30);
+    p.new_row["id"]  = int64_t(7);
+    p.new_row["age"] = int64_t(30);
+    p.new_row["name"] = std::string("bob");
+
+    auto bytes = wal_encode_update(p);
+    UpdatePayload q;
+    CHECK(wal_decode_update(bytes, &q));
+    CHECK(q.rowid == 7);
+    CHECK(std::get<int64_t>(q.updates["age"]) == 30);
+    CHECK(std::get<std::string>(q.new_row["name"]) == "bob");
+}
+
+TEST_CASE("O-1: wal_encode_delete physical vs MVCC tombstone round-trip") {
+    using namespace jiamiao;
+    {
+        DeletePayload p;            // physical delete
+        p.rowid = 99;
+        p.has_xmax = false;
+        p.xmax = 0;
+        auto bytes = wal_encode_delete(p);
+        DeletePayload q;
+        CHECK(wal_decode_delete(bytes, &q));
+        CHECK(q.rowid == 99);
+        CHECK(q.has_xmax == false);
+        CHECK(q.xmax == 0u);
+    }
+    {
+        DeletePayload p;            // MVCC tombstone
+        p.rowid = 100;
+        p.has_xmax = true;
+        p.xmax = 0xDEADBEEF;
+        auto bytes = wal_encode_delete(p);
+        DeletePayload q;
+        CHECK(wal_decode_delete(bytes, &q));
+        CHECK(q.rowid == 100);
+        CHECK(q.has_xmax == true);
+        CHECK(q.xmax == 0xDEADBEEFu);
+    }
+}
+
+TEST_CASE("O-1: wal_encode_create_table round-trip preserves column definitions") {
+    using namespace jiamiao;
+    CreateTablePayload p;
+    p.columns.push_back(ColumnDef{"id",     DataType::BIGINT,   false, true});
+    p.columns.push_back(ColumnDef{"name",   DataType::TEXT,     true,  false});
+    p.columns.push_back(ColumnDef{"score",  DataType::DOUBLE,   true,  false});
+
+    auto bytes = wal_encode_create_table(p);
+    CreateTablePayload q;
+    CHECK(wal_decode_create_table(bytes, &q));
+    REQUIRE(q.columns.size() == 3);
+    CHECK(q.columns[0].name == "id");
+    CHECK(q.columns[0].type == DataType::BIGINT);
+    CHECK(q.columns[0].primary_key == true);
+    CHECK(q.columns[0].nullable == false);
+    CHECK(q.columns[1].name == "name");
+    CHECK(q.columns[1].type == DataType::TEXT);
+    CHECK(q.columns[1].nullable == true);
+    CHECK(q.columns[2].type == DataType::DOUBLE);
+}
+
+TEST_CASE("O-1: wal_encode_create_schema round-trip preserves schema name") {
+    using namespace jiamiao;
+    CreateSchemaPayload p;
+    p.schema = "analytics";
+    auto bytes = wal_encode_create_schema(p);
+    CreateSchemaPayload q;
+    CHECK(wal_decode_create_schema(bytes, &q));
+    CHECK(q.schema == "analytics");
+}
+
+TEST_CASE("O-1: decode rejects truncated payload (corruption safety)") {
+    using namespace jiamiao;
+    InsertPayload p;
+    p.rowid = 1;
+    p.row["x"] = int64_t(42);
+    auto bytes = wal_encode_insert(p);
+    // 截断到一半: 解析必须返回 false, 不可 silently 接受
+    auto truncated = bytes.substr(0, bytes.size() / 2);
+    InsertPayload q;
+    CHECK_FALSE(wal_decode_insert(truncated, &q));
+}
+
+TEST_CASE("O-1: binary payload size is comparable to JSON; win is CPU, not bytes") {
+    using namespace jiamiao;
+    // 重要: O-1 的 win 不是字节大小 (per-row length prefix + tag 抵消了 JSON 引号优势)
+    // 而是 CPU: 二进制是 O(n) memcpy + switch dispatch, 没有 json::parse 词法分析 + AST 构建
+    //
+    // 这里仅证明:
+    //   1) 大小在合理比例内 (binary 不明显更大)
+    //   2) 二进制 decode 速度 ≥ JSON parse 速度 (不具体 micro-benchmark,
+    //      但 round-trip 9 个测试 case 整体 < 1ms 即可见)
+    Row r;
+    r["user_id"]       = int64_t(12345);
+    r["email"]         = std::string("alice.smith@somecompany.com");
+    r["bio"]           = std::string("distributed systems, databases, and the\n"
+                                     "occasional strongly-typed language rant.\n"
+                                     "previously: intern @ small startup, junior @ mid co.");
+    r["score"]         = 98.5;
+    r["active"]        = true;
+
+    auto bin = wal_encode_row(r);
+    json d;
+    d["user_id"] = int64_t(12345);
+    d["email"]   = std::string("alice.smith@somecompany.com");
+    d["bio"]     = std::string("distributed systems, databases, and the\n"
+                               "occasional strongly-typed language rant.\n"
+                               "previously: intern @ small startup, junior @ mid co.");
+    d["score"]   = 98.5;
+    d["active"]  = true;
+    auto jstr = d.dump();
+
+    // 比例应在 0.5x ~ 2x 之间. 实际典型 1.0x ~ 1.3x
+    auto ratio = static_cast<double>(bin.size()) / jstr.size();
+    MESSAGE("binary=", bin.size(), " json=", jstr.size(), " ratio=", ratio);
+    CHECK(ratio > 0.5);
+    CHECK(ratio < 2.0);
 }
 

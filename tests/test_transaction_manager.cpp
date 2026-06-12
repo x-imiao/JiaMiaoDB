@@ -1,6 +1,6 @@
 #include "doctest.h"
 #include "storage/transaction.h"
-#include "json.h"
+#include "common/json.h"
 #include <stdexcept>
 
 using json = Json;

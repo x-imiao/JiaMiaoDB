@@ -28,10 +28,7 @@
 #include <string>
 #include <vector>
 
-#include "../vendor/json.h"
 #include "common/jm_alloc.h"
-
-using json = Json;
 
 namespace jiamiao {
 

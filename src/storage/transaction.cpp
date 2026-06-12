@@ -1,7 +1,7 @@
 #include "transaction.h"
 #include <stdexcept>
 #include <iostream>
-#include "json.h"
+#include "common/json.h"
 
 using json = Json;
 
