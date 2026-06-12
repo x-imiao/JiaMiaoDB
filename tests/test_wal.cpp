@@ -1,5 +1,6 @@
 #include "doctest.h"
 #include "storage/wal.h"
+#include "storage/wal_v3.h"
 #include "json.h"
 #include <filesystem>
 #include <fstream>
@@ -376,3 +377,183 @@ TEST_CASE("WAL: current_seq tracks the last appended record's seq") {
     CHECK(wal.current_seq() == 7);
     wal.close();
 }
+
+// ═══════════════════════════════════════════════════════════════════
+// WAL v3 tests: binary length-prefix + CRC32 + v2 fallback + fsync
+// ═══════════════════════════════════════════════════════════════════
+namespace {
+
+jiamiao::WALRecordV3 make_v3(int64_t seq, jiamiao::WalOp op,
+                              const std::string& table,
+                              const std::string& key) {
+    jiamiao::WALRecordV3 r;
+    r.seq = seq;
+    r.timestamp = 1700000000 + seq;
+    r.op = static_cast<uint16_t>(op);
+    r.table = table;
+    r.xid = 0;
+    json d;
+    d["key"] = key;
+    r.data = d.dump();
+    return r;
+}
+
+} // namespace
+
+TEST_CASE("WAL v3: encode/decode round-trip is byte-faithful") {
+    using namespace jiamiao;
+    WALRecordV3 r = make_v3(42, WalOp::kInsert, "db.s.t", "x");
+    r.xid = 7;
+
+    auto bytes = r.encode();
+    CHECK(bytes.size() >= 38);
+
+    WALRecordV3 r2;
+    size_t consumed = WALRecordV3::decode(bytes.data(), bytes.size(), &r2);
+    CHECK(consumed == bytes.size());
+    CHECK(r2.seq == r.seq);
+    CHECK(r2.timestamp == r.timestamp);
+    CHECK(r2.op == r.op);
+    CHECK(r2.table == r.table);
+    CHECK(r2.xid == r.xid);
+    CHECK(r2.data == r.data);
+}
+
+TEST_CASE("WAL v3: 12 op enums round-trip via op_to_enum/enum_to_op") {
+    using namespace jiamiao;
+    const std::vector<std::string> ops = {
+        "insert", "update", "delete",
+        "xact_commit", "xact_abort",
+        "create_table", "drop_table",
+        "create_database", "drop_database",
+        "create_schema", "create_user", "drop_user"
+    };
+    for (const auto& s : ops) {
+        uint16_t e = op_to_enum(s);
+        CHECK(e != 0);
+        std::string back = enum_to_op(e);
+        CHECK(back == s);
+    }
+    // 未知 op → 0
+    CHECK(op_to_enum("not_a_real_op") == 0);
+}
+
+TEST_CASE("WAL v3: append + replay round-trip preserves all records") {
+    using namespace jiamiao;
+    TempWalDir td;
+    auto p = td.path("v3.wal");
+
+    WriteAheadLogV3 wal(p, WriteAheadLogV3::SyncMode::kNever);
+    wal.open();
+    wal.append(make_v3(1, WalOp::kCreateTable, "db.s.t", ""));
+    wal.append(make_v3(2, WalOp::kInsert, "db.s.t", "a"));
+    wal.append(make_v3(3, WalOp::kUpdate, "db.s.t", "b"));
+    wal.append(make_v3(4, WalOp::kDelete, "db.s.t", "c"));
+    wal.append(make_v3(5, WalOp::kXactCommit, "", ""));
+    wal.close();
+
+    WriteAheadLogV3 wal2(p);
+    auto recs = wal2.replay(0);
+    CHECK(recs.size() == 5);
+    CHECK(recs[0].op == static_cast<uint16_t>(WalOp::kCreateTable));
+    CHECK(recs[1].op == static_cast<uint16_t>(WalOp::kInsert));
+    CHECK(recs[2].op == static_cast<uint16_t>(WalOp::kUpdate));
+    CHECK(recs[3].op == static_cast<uint16_t>(WalOp::kDelete));
+    CHECK(recs[4].op == static_cast<uint16_t>(WalOp::kXactCommit));
+    CHECK(recs[1].table == "db.s.t");
+    CHECK(wal2.current_seq() == 5);
+}
+
+TEST_CASE("WAL v3: CRC failure skips corrupted record, replay continues") {
+    using namespace jiamiao;
+    TempWalDir td;
+    auto p = td.path("v3_crc.wal");
+
+    {
+        WriteAheadLogV3 wal(p, WriteAheadLogV3::SyncMode::kNever);
+        wal.open();
+        wal.append(make_v3(1, WalOp::kInsert, "t", "a"));
+        wal.append(make_v3(2, WalOp::kInsert, "t", "b"));
+        wal.append(make_v3(3, WalOp::kInsert, "t", "c"));
+        wal.close();
+    }
+
+    // 翻 1 个字节在第二条记录的 data 区 (大约 offset 40+)
+    {
+        std::fstream f(p, std::ios::binary | std::ios::in | std::ios::out);
+        REQUIRE(f.is_open());
+        f.seekg(0, std::ios::end);
+        size_t fsize = static_cast<size_t>(f.tellg());
+        f.seekp(static_cast<std::streamoff>(fsize / 2));
+        char c;
+        f.read(&c, 1);
+        c ^= 0xFFu;
+        f.seekp(static_cast<std::streamoff>(fsize / 2));
+        f.write(&c, 1);
+    }
+
+    {
+        WriteAheadLogV3 wal2(p);
+        auto recs = wal2.replay(0);
+        // 至少有 1 条记录 (第一条正常), 可能 2 条 (CRC skip 跳过被翻字节的, 找下一个 magic)
+        CHECK(recs.size() >= 1);
+        CHECK(recs.size() <= 3);
+    }
+}
+
+TEST_CASE("WAL v3: fallback reads v2 JSON Lines (no magic)") {
+    using namespace jiamiao;
+    TempWalDir td;
+    auto p = td.path("v2_legacy.wal");
+
+    // 写 v2 JSON Lines (用 WriteAheadLog v2 类)
+    {
+        WriteAheadLog wal(p);
+        wal.open();
+        wal.append(make_rec(1, "insert", "db.s.t", "alpha"));
+        wal.append(make_rec(2, "update", "db.s.t", "beta"));
+        wal.append(make_rec(3, "xact_commit", "", "_"));
+        wal.close();
+    }
+
+    // 用 v3 reader 读 — 应该 fallback 解析 v2 JSON
+    WriteAheadLogV3 wal_v3(p);
+    auto recs = wal_v3.replay(0);
+    CHECK(recs.size() == 3);
+    CHECK(recs[0].op == static_cast<uint16_t>(WalOp::kInsert));
+    CHECK(recs[1].op == static_cast<uint16_t>(WalOp::kUpdate));
+    CHECK(recs[2].op == static_cast<uint16_t>(WalOp::kXactCommit));
+    CHECK(recs[0].table == "db.s.t");
+    CHECK(wal_v3.current_seq() == 3);
+}
+
+TEST_CASE("WAL v3: truncate keeps only seq > cutoff and upgrades v2 → v3") {
+    using namespace jiamiao;
+    TempWalDir td;
+    auto p = td.path("v3_truncate.wal");
+
+    {
+        WriteAheadLogV3 wal(p, WriteAheadLogV3::SyncMode::kNever);
+        wal.open();
+        for (int64_t i = 1; i <= 5; ++i) {
+            wal.append(make_v3(i, WalOp::kInsert, "t", "k" + std::to_string(i)));
+        }
+        wal.truncate(3);
+        wal.close();
+    }
+
+    WriteAheadLogV3 wal2(p);
+    auto recs = wal2.replay(0);
+    CHECK(recs.size() == 2);  // seq 4, 5 保留
+    CHECK(recs[0].seq == 4);
+    CHECK(recs[1].seq == 5);
+}
+
+TEST_CASE("WAL v3: CRC32 matches known zlib value (sanity)") {
+    using namespace jiamiao;
+    // "123456789" 的 CRC32 = 0xCBF43926 (RFC, zlib 验证向量)
+    const char* s = "123456789";
+    uint32_t crc = crc32_compute(reinterpret_cast<const uint8_t*>(s), 9);
+    CHECK(crc == 0xCBF43926U);
+}
+

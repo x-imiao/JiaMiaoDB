@@ -1,6 +1,6 @@
-/* ══════════════════════════════════════════════════════════════════════
-   memtable.cpp — MemTable 实现
-   ══════════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════
+   memtable.cpp — MemTable 实现 (Phase 2: 真并发 SkipList + Arena)
+   ═══════════════════════════════════════════════════════════════════════ */
 
 #include "memtable.h"
 
@@ -11,7 +11,18 @@ namespace jiamiao {
 
 // ── 构造 ──
 MemTable::MemTable(std::string qualified_name)
-    : name_(std::move(qualified_name)) {}
+    : name_(std::move(qualified_name)),
+      arena_(std::make_unique<Arena>()),
+      skiplist_(std::make_unique<SkipList<InternalKey, Tuple>>(arena_.get())) {}
+
+// ── 析构 ──
+//   显式声明: 让 unique_ptr<SkipList> / unique_ptr<Arena> 析构顺序确定
+MemTable::~MemTable() = default;
+
+// ── size ──
+size_t MemTable::size() const {
+    return skiplist_->size();
+}
 
 // ── put: 写入新版本 ──
 //   旧版本保留 (MVCC), 同 row_id 不同 seq 共存
@@ -19,7 +30,7 @@ void MemTable::put(int64_t row_id, const Tuple& t, uint64_t seq) {
     InternalKey k{make_user_key(name_, row_id), seq};
     Tuple copy = t;  // 按值存, 拷贝 payload
     copy.hdr.payload_len = static_cast<uint32_t>(copy.payload.size());
-    skiplist_.put(k, std::move(copy));
+    skiplist_->put(k, std::move(copy));
 
     int64_t cur = max_row_id_.load(std::memory_order_relaxed);
     while (row_id > cur && !max_row_id_.compare_exchange_weak(
@@ -40,15 +51,13 @@ void MemTable::tombstone(int64_t row_id, TransactionId xmax, uint64_t seq) {
 }
 
 // ── get_versions: 同 row_id 所有版本 (seq DESC) ──
+//   注意: Phase 2 真跳表无 range_with_keys, 用 scan + filter 模拟.
 std::vector<Tuple> MemTable::get_versions(int64_t row_id) const {
     std::string uk = make_user_key(name_, row_id);
-    std::vector<Tuple> out;
-    auto all = skiplist_.all();
-    for (const auto& t : all) {
-        if (make_user_key(name_, static_cast<int64_t>(t.hdr.row_id)) == uk) {
-            out.push_back(t);
-        }
-    }
+    // user_key ASC + seq DESC 排序: lo = (uk, MAX_SEQ), hi = (uk, 0)
+    InternalKey lo{uk, UINT64_MAX};
+    InternalKey hi{uk, 0};
+    std::vector<Tuple> out = skiplist_->range(lo, hi);
     return out;
 }
 
@@ -56,19 +65,19 @@ std::vector<Tuple> MemTable::get_versions(int64_t row_id) const {
 std::optional<Tuple> MemTable::get_latest(int64_t row_id) const {
     auto versions = get_versions(row_id);
     if (versions.empty()) return std::nullopt;
-    return versions.front();
+    return versions.front();  // seq DESC 排序, 第一个就是最新
 }
 
 // ── scan_all: 全表扫描, row_id ASC, 同 row_id 内 seq DESC ──
 std::vector<Tuple> MemTable::scan_all() const {
-    return skiplist_.all();
+    return skiplist_->all();
 }
 
 // ── vacuum: 返回可被物理清理的 entry 数 ──
 //   判定: xmax != 0 && clog.get_status(xmax) == COMMITTED
 //         && xmax < oldest_active_xid
 size_t MemTable::vacuum(CLog& clog, TransactionId oldest_active_xid) {
-    auto all = skiplist_.all();
+    auto all = skiplist_->all();
     size_t can_purge = 0;
     for (const auto& t : all) {
         if (t.hdr.xmax == 0) continue;
@@ -83,16 +92,9 @@ size_t MemTable::vacuum(CLog& clog, TransactionId oldest_active_xid) {
 //   物理删除, 跳过 visibility 检查. 调用方负责正确性.
 size_t MemTable::erase_all_for(int64_t row_id) {
     std::string uk = make_user_key(name_, row_id);
-    // range_with_keys 给精确 InternalKey
     InternalKey lo{uk, UINT64_MAX};
     InternalKey hi{uk, 0};
-    auto entries = skiplist_.range_with_keys(lo, hi);
-    size_t erased = 0;
-    for (const auto& [k, t] : entries) {
-        if (static_cast<int64_t>(t.hdr.row_id) != row_id) continue;
-        if (skiplist_.erase(k)) ++erased;
-    }
-    return erased;
+    return skiplist_->erase_range(lo, hi);
 }
 
 }  // namespace jiamiao

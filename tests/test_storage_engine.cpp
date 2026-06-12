@@ -3,6 +3,7 @@
 #include "storage/transaction.h"
 #include "storage/tuple.h"
 #include "storage/memtable.h"
+#include "storage/arena.h"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -1116,4 +1117,228 @@ TEST_CASE("Savepoint stress: 3-level nested with 50 interleaved ops × 100 itera
         if (v && *v >= 1 && *v <= 5) ++seed_seen;
     }
     CHECK(seed_seen == 5);  // seed 行始终保留
+}
+
+// ──── Phase 2 LSM: Arena ────
+
+TEST_CASE("Arena: 1M small allocs track bytes_used and stay within blocks") {
+    jm::Arena arena;
+    constexpr size_t kCount = 1'000'000;
+    constexpr size_t kObjSize = 8;
+
+    // 每次分配 8 字节 (1 个 int64)
+    std::vector<int64_t*> ptrs;
+    ptrs.reserve(kCount);
+    for (size_t i = 0; i < kCount; ++i) {
+        auto* p = static_cast<int64_t*>(arena.allocate(kObjSize));
+        REQUIRE(p != nullptr);
+        *p = static_cast<int64_t>(i);  // 验证可写
+        ptrs.push_back(p);
+    }
+
+    CHECK(arena.bytes_used() == kCount * kObjSize);
+    // 64KB 块, 1M * 8B = 8MB. 每块装 64K/8 = 8192 obj → 至少 122 块.
+    // 误差来自尾部不满块 + 初始块可能 1 个 = 123~128 块.
+    CHECK(arena.block_count() >= 120);
+    CHECK(arena.block_count() <= 130);
+
+    // 验证指针有效 (没被覆盖)
+    for (size_t i = 0; i < kCount; ++i) {
+        CHECK(*ptrs[i] == static_cast<int64_t>(i));
+    }
+}
+
+TEST_CASE("Arena: 100KB alloc goes to a dedicated block (bump-block not bloated)") {
+    jm::Arena arena;
+
+    // 分配几个小块 (落到 kBlockSize 主块)
+    for (int i = 0; i < 10; ++i) {
+        arena.allocate(64);
+    }
+    size_t blocks_before = arena.block_count();
+
+    // 100KB 单次分配 (> 16KB 阈值) → 独立块
+    void* big = arena.allocate(100 * 1024);
+    REQUIRE(big != nullptr);
+
+    // block_count 增 1 (独立块)
+    CHECK(arena.block_count() == blocks_before + 1);
+    CHECK(arena.bytes_used() >= 100 * 1024);
+
+    // 再分配 64 字节小块: 应该落到原主块, 不污染大块
+    void* small = arena.allocate(64);
+    REQUIRE(small != nullptr);
+    CHECK(arena.block_count() == blocks_before + 1);  // 没新增块
+}
+
+TEST_CASE("Arena: reset() releases all blocks, subsequent allocate works") {
+    jm::Arena arena;
+
+    // 灌满一些数据
+    for (int i = 0; i < 1000; ++i) {
+        arena.allocate(128);
+    }
+    size_t blocks_before = arena.block_count();
+    REQUIRE(blocks_before >= 1);
+    REQUIRE(arena.bytes_used() > 0);
+
+    // reset
+    arena.reset();
+    CHECK(arena.bytes_used() == 0);
+    // block_count 保留 (用于观察 peak), reset 仅释放内存
+    CHECK(arena.block_count() == blocks_before);
+
+    // 后续分配仍能用
+    void* p = arena.allocate(64);
+    REQUIRE(p != nullptr);
+    *static_cast<int64_t*>(p) = 0xCAFE;
+    CHECK(*static_cast<int64_t*>(p) == 0xCAFE);
+    CHECK(arena.bytes_used() == 64);
+}
+
+// ──── Phase 2 LSM: SkipList ────
+
+#include "storage/skiplist.h"
+#include <thread>
+#include <vector>
+
+namespace {
+// Helper: 顺序 int 键 + 简单 int 值
+using IntSkipList = jm::SkipList<int, int>;
+}
+
+TEST_CASE("SkipList: 1000 元素 put + range 顺序遍历 (Pugh 经典)") {
+    jm::Arena arena;
+    IntSkipList sl(&arena);
+
+    // 顺序插入 0..999
+    for (int i = 0; i < 1000; ++i) {
+        sl.put(i, i * 10);
+    }
+    CHECK(sl.size() == 1000);
+
+    // range(200, 205) 应得 200..205
+    auto v = sl.range(200, 205);
+    REQUIRE(v.size() == 6);
+    for (int i = 0; i < 6; ++i) {
+        CHECK(v[i] == (200 + i) * 10);
+    }
+
+    // all() 应得 0..999 顺序
+    auto all = sl.all();
+    REQUIRE(all.size() == 1000);
+    for (int i = 0; i < 1000; ++i) {
+        CHECK(all[i] == i * 10);
+    }
+
+    // get_exact
+    auto p = sl.get_exact(500);
+    REQUIRE(p.has_value());
+    CHECK(*p == 5000);
+    CHECK_FALSE(sl.get_exact(10000).has_value());
+}
+
+TEST_CASE("SkipList: 1 writer + 4 readers 100k 操作, 读数 == 写数") {
+    jm::Arena arena;
+    IntSkipList sl(&arena);
+
+    constexpr int kWrites = 100000;
+    constexpr int kReaders = 4;
+
+    // Writer 线程: 顺序 put 0..kWrites-1
+    std::thread writer([&]() {
+        for (int i = 0; i < kWrites; ++i) {
+            sl.put(i, i);
+        }
+    });
+
+    // 4 Reader 线程: 不停 all() / range(), 统计累计读到的元素数
+    std::atomic<int> total_seen{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> readers;
+    for (int r = 0; r < kReaders; ++r) {
+        readers.emplace_back([&]() {
+            int local = 0;
+            while (!stop.load(std::memory_order_relaxed)) {
+                auto all = sl.all();
+                local += static_cast<int>(all.size());
+                // 也跑 range 验证 lock-free 读不会挂
+                (void)sl.range(0, 1000);
+            }
+            total_seen.fetch_add(local, std::memory_order_relaxed);
+        });
+    }
+
+    writer.join();
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& t : readers) t.join();
+
+    // 最终: 100k 元素都在
+    CHECK(sl.size() == kWrites);
+    auto final_all = sl.all();
+    REQUIRE(final_all.size() == kWrites);
+    // 顺序检查
+    for (int i = 0; i < kWrites; ++i) {
+        REQUIRE(final_all[i] == i);
+    }
+    // reader 至少读了 N 次 (具体值不严格, 不为 0 即可)
+    CHECK(total_seen.load() > 0);
+
+    MESSAGE("1W+4R 100k ops: total reader iterations seen = ", total_seen.load());
+}
+
+TEST_CASE("SkipList: erase_range 批量删 + size 维护") {
+    jm::Arena arena;
+    IntSkipList sl(&arena);
+
+    for (int i = 0; i < 100; ++i) sl.put(i, i);
+    CHECK(sl.size() == 100);
+
+    // 删 [30, 39] 共 10 个
+    size_t erased = sl.erase_range(30, 39);
+    CHECK(erased == 10);
+    CHECK(sl.size() == 90);
+
+    // [30, 39] 不存在
+    for (int i = 30; i <= 39; ++i) CHECK_FALSE(sl.get_exact(i).has_value());
+    // 边界 29, 40 还在
+    CHECK(sl.get_exact(29).has_value());
+    CHECK(sl.get_exact(40).has_value());
+
+    // 再删 [40, 50]
+    erased = sl.erase_range(40, 50);
+    CHECK(erased == 11);  // 40, 41, ..., 50
+    CHECK(sl.size() == 79);
+
+    // all() 不应含 [30, 50]
+    auto all = sl.all();
+    for (int v : all) {
+        bool in_range = (v >= 30 && v <= 50);
+        CHECK_FALSE(in_range);
+    }
+}
+
+TEST_CASE("SkipList: TSan-friendly 并发 1W+1R 小规模 (CI gate)") {
+    // 1 writer + 1 reader 小规模 1k 操作, 主要为 TSan 跑通.
+    // 真正的 TSan 跑在 CI: cmake -DCMAKE_CXX_FLAGS="-fsanitize=thread" .
+    jm::Arena arena;
+    IntSkipList sl(&arena);
+
+    constexpr int kWrites = 1000;
+    std::atomic<bool> stop{false};
+    int reader_seen = 0;
+
+    std::thread reader([&]() {
+        while (!stop.load(std::memory_order_relaxed)) {
+            reader_seen += static_cast<int>(sl.all().size());
+        }
+    });
+
+    for (int i = 0; i < kWrites; ++i) sl.put(i, i);
+
+    stop.store(true, std::memory_order_relaxed);
+    reader.join();
+
+    CHECK(sl.size() == kWrites);
+    CHECK(reader_seen > 0);
 }

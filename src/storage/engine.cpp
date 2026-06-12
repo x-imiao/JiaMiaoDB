@@ -77,7 +77,7 @@ StorageEngine::StorageEngine(const std::string& data_dir, int checkpoint_interva
     if (!std::filesystem::exists(data_dir)) {
         std::filesystem::create_directories(data_dir);
     }
-    wal_ = std::make_unique<WriteAheadLog>(data_dir + "/wal.log");
+    wal_ = std::make_unique<jiamiao::WriteAheadLogV3>(data_dir + "/wal.log");
     ckp_mgr_ = std::make_unique<CheckpointManager>(data_dir);
     txn_mgr_ = std::make_unique<jiamiao::TransactionManager>();
     catalog_ = std::make_unique<Catalog>();
@@ -167,10 +167,24 @@ void StorageEngine::load() {
     txn_mgr_->rebuild_active_from_clog();
     txn_mgr_->reset_context();
 
-    // 3. 重放 WAL
+    // 3. 重放 WAL (v3 binary 或 v2 JSON fallback)
     wal_->open();
     auto records = wal_->replay(ckp.last_seq);
-    for (const auto& rec : records) {
+    for (const auto& v3rec : records) {
+        // 把 v3 记录转回 WALRecord (替代 op enum 用 string, data JSON 文本 parse 回 json)
+        WALRecord rec;
+        rec.seq       = v3rec.seq;
+        rec.timestamp = v3rec.timestamp;
+        rec.op        = jiamiao::enum_to_op(v3rec.op);
+        rec.table     = v3rec.table;
+        if (!v3rec.data.empty()) {
+            try {
+                rec.data = json::parse(v3rec.data);
+            } catch (...) {
+                rec.data = json();  // 损坏的 JSON, 跳过
+                continue;
+            }
+        }
         replay_record(rec);
     }
 
@@ -1565,6 +1579,12 @@ void StorageEngine::write_wal(const std::string& op, const std::string& table,
     if (xid != jiamiao::InvalidTransactionId) {
         enriched["_xid"] = static_cast<int64_t>(xid);
     }
-    WALRecord rec{seq, time(nullptr), op, table, enriched};
+    jiamiao::WALRecordV3 rec;
+    rec.seq       = seq;
+    rec.timestamp = time(nullptr);
+    rec.op        = jiamiao::op_to_enum(op);
+    rec.table     = table;
+    rec.xid       = (xid != jiamiao::InvalidTransactionId) ? static_cast<uint32_t>(xid) : 0u;
+    rec.data      = enriched.dump();
     wal_->append(rec);
 }

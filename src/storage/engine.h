@@ -10,6 +10,7 @@
 #include <mutex>
 #include "../types.h"
 #include "wal.h"
+#include "wal_v3.h"
 #include "checkpoint.h"
 #include "transaction.h"
 #include "catalog.h"
@@ -119,7 +120,7 @@ private:
     std::map<std::string, int64_t> row_ids_;
     std::map<std::string, std::vector<IndexInfo>> indexes_;
 
-    std::unique_ptr<WriteAheadLog> wal_;
+    std::unique_ptr<jiamiao::WriteAheadLogV3> wal_;
     std::unique_ptr<CheckpointManager> ckp_mgr_;
     std::unique_ptr<jiamiao::TransactionManager> txn_mgr_;
     std::unique_ptr<Catalog> catalog_;
