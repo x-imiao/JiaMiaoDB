@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include "../types.h"
+#include "common/memcontext.h"
 #include "wal.h"
 #include "wal_v3.h"
 #include "checkpoint.h"
@@ -127,6 +128,15 @@ private:
 
     std::string data_dir_;
     int checkpoint_interval_;
+
+    // ── Memory Context 树 (Phase 3) ──
+    //   engine_ctx_     : StorageEngine 寿命, 持有所有 sub-context
+    //   wal_ctx_        : WAL bytes 临时分配
+    //   vacuum_ctx_     : vacuum 循环中临时分配
+    //   ~StorageEngine 时统一 delete engine_ctx_ → 级联释放所有子 context
+    ::jiamiao::MemoryContext engine_ctx_ = nullptr;
+    ::jiamiao::MemoryContext wal_ctx_    = nullptr;
+    ::jiamiao::MemoryContext vacuum_ctx_ = nullptr;
 
     // ── 并发原语 (Phase 2) ──
     // lifecycle: load/save/close/replay, 启动期单线程

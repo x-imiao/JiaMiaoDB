@@ -105,17 +105,20 @@ uint32_t crc32_compute(const uint8_t* data, size_t len) {
 // Binary encode helpers (small-endian, 直接写 raw 字节)
 // ═══════════════════════════════════════════════════════════
 namespace {
-inline void put_u16(std::vector<uint8_t>& b, uint16_t v) {
+template <typename Alloc>
+inline void put_u16(std::vector<uint8_t, Alloc>& b, uint16_t v) {
     b.push_back(static_cast<uint8_t>(v & 0xFFU));
     b.push_back(static_cast<uint8_t>((v >> 8) & 0xFFU));
 }
-inline void put_u32(std::vector<uint8_t>& b, uint32_t v) {
+template <typename Alloc>
+inline void put_u32(std::vector<uint8_t, Alloc>& b, uint32_t v) {
     b.push_back(static_cast<uint8_t>(v & 0xFFU));
     b.push_back(static_cast<uint8_t>((v >> 8) & 0xFFU));
     b.push_back(static_cast<uint8_t>((v >> 16) & 0xFFU));
     b.push_back(static_cast<uint8_t>((v >> 24) & 0xFFU));
 }
-inline void put_u64(std::vector<uint8_t>& b, uint64_t v) {
+template <typename Alloc>
+inline void put_u64(std::vector<uint8_t, Alloc>& b, uint64_t v) {
     for (int i = 0; i < 8; ++i) {
         b.push_back(static_cast<uint8_t>((v >> (i * 8)) & 0xFFU));
     }
@@ -141,8 +144,8 @@ inline uint64_t read_u64(const uint8_t* p) {
 // ═══════════════════════════════════════════════════════════
 // WALRecordV3::encode / decode
 // ═══════════════════════════════════════════════════════════
-std::vector<uint8_t> WALRecordV3::encode() const {
-    std::vector<uint8_t> buf;
+std::vector<uint8_t, JMAlloc<uint8_t>> WALRecordV3::encode() const {
+    std::vector<uint8_t, JMAlloc<uint8_t>> buf;
     buf.reserve(38 + table.size() + data.size());
 
     // magic + version + op + seq + timestamp + tlen + table + xid + data_len + data

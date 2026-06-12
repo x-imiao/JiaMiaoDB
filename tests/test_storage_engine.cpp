@@ -4,6 +4,7 @@
 #include "storage/tuple.h"
 #include "storage/memtable.h"
 #include "storage/arena.h"
+#include "common/memcontext.h"
 #include <atomic>
 #include <chrono>
 #include <cstdio>

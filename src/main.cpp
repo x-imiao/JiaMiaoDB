@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include "config.h"
 #include "server/server.h"
+#include "common/memcontext.h"
 
 JiamiaoDBServer* g_server = nullptr;
 
@@ -32,6 +33,9 @@ void print_usage(const char* prog) {
 }
 
 int main(int argc, char* argv[]) {
+    // 必须最先初始化 MemoryContext: WAL replay 在 StorageEngine ctor 内, 那时已用 jmalloc
+    jiamiao::MemoryContextInit();
+
     // 默认配置路径
     std::string config_path = "./jiamiao.config.json";
 

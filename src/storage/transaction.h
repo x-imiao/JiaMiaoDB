@@ -130,7 +130,9 @@ struct Savepoint {
 struct Snapshot {
     TransactionId              xmin  = InvalidTransactionId;
     TransactionId              xmax  = InvalidTransactionId;
-    std::vector<TransactionId> xip;   // 活跃事务列表
+    // Phase 3 NOTE: xip 暂用默认 allocator (测试代码已用 std::vector<uint32_t> 直接 assign).
+    // 转换 JMAlloc<TransactionId> 需要所有构造点同步, Phase 3b 再做.
+    std::vector<TransactionId> xip;
     int32_t                    curcid = 0;
 };
 

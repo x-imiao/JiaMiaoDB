@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "../vendor/json.h"
+#include "common/jm_alloc.h"
 
 using json = Json;
 
@@ -73,7 +74,8 @@ struct WALRecordV3 {
 
     // 编码: 整条记录 (含 magic, version, ..., crc32) → bytes.
     // crc32 内部计算, 调用方不需填.
-    std::vector<uint8_t> encode() const;
+    // 返回 vector 走 jmalloc (WALContext); 调用方应尽快消费 (.data() 拷到 fd / mmap 后即丢).
+    std::vector<uint8_t, JMAlloc<uint8_t>> encode() const;
 
     // 解码: 从 buf 起始处尝试解析一条记录. 返回消费字节数 (>0).
     // 返回 0 表示数据不完整 (缓冲不够). 返回 SIZE_MAX 表示 CRC 失败 (调用方决定跳过策略).

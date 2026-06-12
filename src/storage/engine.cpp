@@ -77,13 +77,38 @@ StorageEngine::StorageEngine(const std::string& data_dir, int checkpoint_interva
     if (!std::filesystem::exists(data_dir)) {
         std::filesystem::create_directories(data_dir);
     }
+
+    // Phase 3: 建 MemoryContext 树 (在 jmalloc 可用之前不要 jmalloc)
+    //   假设 main() 已调 MemoryContextInit() 创建 TopMemoryContext
+    jiamiao::MemoryContext parent = jiamiao::TopMemoryContext;
+    if (parent == nullptr) {
+        // 防御: 调用方未 init (例如测试), 同步建一个
+        jiamiao::MemoryContextInit();
+        parent = jiamiao::TopMemoryContext;
+    }
+    engine_ctx_ = jiamiao::JMAllocSetContextCreate(parent, "EngineContext",
+                                                   0, 8 * 1024, 8 * 1024 * 1024);
+    wal_ctx_    = jiamiao::JMAllocSetContextCreate(engine_ctx_, "WALContext",
+                                                   0, 8 * 1024, 1 * 1024 * 1024);
+    vacuum_ctx_ = jiamiao::JMAllocSetContextCreate(engine_ctx_, "VacuumContext",
+                                                   0, 8 * 1024, 1 * 1024 * 1024);
+
     wal_ = std::make_unique<jiamiao::WriteAheadLogV3>(data_dir + "/wal.log");
     ckp_mgr_ = std::make_unique<CheckpointManager>(data_dir);
     txn_mgr_ = std::make_unique<jiamiao::TransactionManager>();
     catalog_ = std::make_unique<Catalog>();
 }
 
-StorageEngine::~StorageEngine() { close(); }
+StorageEngine::~StorageEngine() {
+    close();
+    // delete engine_ctx_ 级联释放 wal_ctx_ / vacuum_ctx_
+    if (engine_ctx_ != nullptr) {
+        jiamiao::MemoryContextDelete(engine_ctx_);
+        engine_ctx_ = nullptr;
+        wal_ctx_    = nullptr;
+        vacuum_ctx_ = nullptr;
+    }
+}
 
 void StorageEngine::load() {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
@@ -1579,6 +1604,9 @@ void StorageEngine::write_wal(const std::string& op, const std::string& table,
     if (xid != jiamiao::InvalidTransactionId) {
         enriched["_xid"] = static_cast<int64_t>(xid);
     }
+    // Phase 3: encode() 的 byte buffer 走 jmalloc (WALContext).
+    // 出 scope 时 buffer 整体 reset, 实际字节已 write 到 fd.
+    jiamiao::ScopeContext wal_scope(wal_ctx_);
     jiamiao::WALRecordV3 rec;
     rec.seq       = seq;
     rec.timestamp = time(nullptr);

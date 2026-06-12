@@ -1,8 +1,9 @@
 /* ═══════════════════════════════════════════════════════════════════════
-   arena.cpp — Arena 实现
+   arena.cpp — Arena 实现 (Phase 3: 改用 jmalloc/jmfree)
    ═══════════════════════════════════════════════════════════════════════ */
 
 #include "arena.h"
+#include "common/jm_alloc.h"
 
 #include <cstdlib>
 #include <new>
@@ -14,7 +15,8 @@ namespace jiamiao {
 std::unique_ptr<Arena::Block> Arena::alloc_block(size_t cap) {
     // cap 向上对齐到 8 字节
     cap = (cap + 7) & ~size_t{7};
-    char* buf = static_cast<char*>(std::malloc(cap));
+    // Phase 3: 走 jmalloc, 字节进 CurrentMemoryContext (由 MemTable 持有的 EngineContext)
+    char* buf = static_cast<char*>(jmalloc(cap));
     if (!buf) {
         throw std::bad_alloc();
     }
@@ -42,7 +44,7 @@ void* Arena::alloc_in_block(Block& blk, size_t bytes, size_t align) {
 Arena::Arena() = default;
 
 // ── 析构 ──
-//   unique_ptr<Block> 链递归释放; 块内 char[] 用 std::malloc, 对应 std::free.
+//   unique_ptr<Block> 链递归释放; 块内 char[] 走 jmfree.
 Arena::~Arena() = default;
 
 // ── allocate ──
@@ -101,15 +103,16 @@ void* Arena::allocate_aligned(size_t bytes, size_t align) {
 // ── reset ──
 void Arena::reset() {
     std::lock_guard<std::mutex> lk(mutex_);
-    // 释放每个块的 malloc 内存
+    // 释放每个块的 jmalloc 字节 (注意: jmfree 走 freelist 复用, 不立即归还 OS)
     for (Block* b = head_.get(); b != nullptr; b = b->next.get()) {
-        std::free(b->data);
+        if (b->data != nullptr) {
+            jmfree(b->data);
+        }
         b->data = nullptr;
         b->used = 0;
         b->cap  = 0;
     }
-    // 释放块节点 (unique_ptr 链, 但头节点单独 drop)
-    // 简单做法: 把 head_ 替换成 nullptr 释放链; current_ 已是 dangling
+    // 释放块节点 (unique_ptr 链)
     head_.reset();
     current_ = nullptr;
     bytes_used_  = 0;
