@@ -1,8 +1,8 @@
 # JiaMiaoDB
 
-AI Native Database · v2.3.0
+AI Native Database · v1.0
 
-一个用 C++17 编写的单节点内存数据库，支持自然语言查询和传统 SQL，包含完整的事务子系统（多级锁、RC/RR/SSI 隔离、Savepoint、VACUUM、XID 回卷保护）。存储层已沿 RocksDB 路线重构为 LSM 风格（真并发 SkipList + Arena bump allocator + 二进制 WAL/Checkpoint/Catalog/CLog），启动路径无 JSON 词法分析开销。
+一个用 C++17 编写的单节点内存数据库。其设计参考 PostgreSQL 的内核语义（多版本并发控制、SSI 串行化快照隔离、Savepoint、XID 回卷保护、Checkpoint 事务感知）与 RocksDB 的存储层架构（MemTable + 二进制 WAL + Pugh 真并发跳表 + Arena 内存池），并把大语言模型作为一等公民接入协议层，提供自然语言到 SQL 的端到端查询链路。全栈自实现，仅依赖 libcurl。
 
 ## 特性
 
