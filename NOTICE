@@ -1,0 +1,60 @@
+JiaMiaoDB
+Copyright 2026 miaoyuIjuaner
+
+This product includes software and ideas developed by third parties:
+
+────────────────────────────────────────────────────────────────────────
+PostgreSQL (PostgreSQL License — BSD-style, permissive)
+────────────────────────────────────────────────────────────────────────
+The Memory Context subsystem in src/common/{memcontext,allocset,bump,jm_alloc}.{h,cpp}
+is a C++17 port of the algorithm design of:
+
+  - src/backend/utils/mmgr/mcxt.c    (MemoryContext / AllocSet / reset / callback)
+  - src/backend/utils/mmgr/aset.c    (power-of-2 freelist, AllocSetAlloc/Free/Reset)
+  - src/backend/utils/mmgr/bump.c    (Bump allocator, no per-chunk free)
+
+PostgreSQL is Copyright © 1996–2026, The PostgreSQL Global Development Group.
+Licensed under the PostgreSQL License, a BSD-style open source license.
+A copy of the PostgreSQL License is available at:
+  https://www.postgresql.org/about/licence/
+
+The JiaMiaoDB implementation is an independent C++ rewrite — class names,
+APIs, allocator layout, and code structure are original — but the algorithmic
+ideas (freelist index, keeper block + dedicated blocks for large allocs,
+reset semantics) are derived from the above PostgreSQL source files.
+
+────────────────────────────────────────────────────────────────────────
+Pugh Skip Lists (academic, no copyright)
+────────────────────────────────────────────────────────────────────────
+The concurrent skip list in src/storage/skiplist.h follows the algorithm of:
+
+  William Pugh, "Skip Lists: A Probabilistic Alternative to Balanced Trees",
+  Communications of the ACM, June 1990, 33(6) pp. 668–676.
+
+The single-writer / multi-reader (SWMR) lock-free read path with acquire /
+release memory ordering is also inspired by Doug Lea's
+java.util.concurrent.ConcurrentSkipListMap (public domain / CC0).
+
+────────────────────────────────────────────────────────────────────────
+zlib CRC32 (public domain)
+────────────────────────────────────────────────────────────────────────
+The CRC32 implementation in src/storage/wal_v3.cpp uses the
+Ethernet/zlib polynomial 0xEDB88320. The zlib project is released
+into the public domain; see https://www.zlib.net/
+
+────────────────────────────────────────────────────────────────────────
+doctest (MIT License)
+────────────────────────────────────────────────────────────────────────
+The unit test framework in src/vendor/doctest.h is:
+
+  Copyright (c) 2016-2023 Viktor Kirilov
+
+Distributed under the MIT Software License. See the file header for the
+full text and https://opensource.org/licenses/MIT
+
+────────────────────────────────────────────────────────────────────────
+libcurl (MIT/X derivate license)
+────────────────────────────────────────────────────────────────────────
+JiaMiaoDB links against libcurl at runtime for HTTP calls to the LLM
+provider. Copyright © Daniel Stenberg and many contributors.
+See https://curl.se/docs/copyright.html

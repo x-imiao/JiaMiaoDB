@@ -3,3 +3,6 @@ bld/
 *.o
 *.out
 data/
+
+# Local config (contains real api_key) — keep the .example version tracked
+jiamiao.config.json

@@ -1,6 +1,7 @@
 {
-    "说明": "JiamiaoDB 配置文件",
-    "警告": "不要上传到 GitHub！",
+    "_comment_1": "JiaMiaoDB configuration template.",
+    "_comment_2": "Copy this file to jiamiao.config.json and fill in your ai.api_key.",
+    "_comment_3": "jiamiao.config.json is gitignored so your real key stays local.",
 
     "server": {
         "host": "127.0.0.1",
