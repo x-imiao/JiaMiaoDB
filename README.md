@@ -33,7 +33,7 @@ AI Native Database · v1.0
 
 ```bash
 cd bld && ctest --output-on-failure
-# 或: ./bld/jiamiaodb_test
+# 或: ./bld/JMDB_test
 ```
 
 ## 测试覆盖
