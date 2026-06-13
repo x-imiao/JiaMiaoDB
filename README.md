@@ -36,19 +36,6 @@ cd bld && ctest --output-on-failure
 # 或: ./bld/jiamiaodb_test
 ```
 
-## 二进制化路线（O-1 ~ O-6, 已完成）
-
-| 阶段 | 范围 | 收益 |
-|------|------|------|
-| O-1 | WAL record `data` 字段 JSON→二进制 (`wal_payload`) | replay 路径去掉 `json::parse` 词法分析 + AST 构建 |
-| O-2 | Checkpoint 文件 JSON→二进制 (`checkpoint.bin` + 强类型 Row/Index) | 启动快 5-10x, 体积收缩 5-10x |
-| O-3 | Catalog 快照 JSON→二进制 (`catalog_encode`) | Checkpoint 嵌入段去掉 JSON |
-| O-4 | CLog 状态 JSON→二进制 (`clog_encode`, 5B/entry) | 1M 事务 ~5MB (vs JSON ~80MB) |
-| O-5 | 删除 v2 WAL (`wal.h` / `wal.cpp`) | 启动代码无 v2 fallback 路径 |
-| O-6 | `src/vendor/json.h` → `src/common/json.h` | Json 类从 "vendor 第三方" 转为 "项目自有", 收敛依赖 |
-
-所有阶段均通过功能门禁 (13 个 SQL 功能测试, 模拟用户视角)。
-
 ## 测试覆盖
 
 188 单元测试，全部通过：
