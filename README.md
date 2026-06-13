@@ -2,7 +2,7 @@
 
 AI Native Database · v1.0
 
-一个用 C++17 编写的单节点内存数据库。其设计参考 PostgreSQL 的内核语义（多版本并发控制、SSI 串行化快照隔离、Savepoint、XID 回卷保护、Checkpoint 事务感知）与 RocksDB 的存储层架构（MemTable + 二进制 WAL + Pugh 真并发跳表 + Arena 内存池），并把大语言模型作为一等公民接入协议层，提供自然语言到 SQL 的端到端查询链路。全栈自实现，仅依赖 libcurl。
+一个用 C++17 编写的单节点内存数据库。其设计参考 PostgreSQL 的内核语义（多版本并发控制、SSI 串行化快照隔离、Savepoint、XID 回卷保护、Checkpoint 事务感知）与 RocksDB 的存储层架构（MemTable + 二进制 WAL + Pugh 真并发跳表 + Arena 内存池），并内置自然语言查询入口：非 SQL 输入被路由到 LLM，模型根据当前 schema 上下文返回结构化 `UnifiedIntent`（类别、表集合、SQL AST），执行器据此生成计划并运行，结果连同耗时写入 `WorkloadMemory` 用于后续策略推荐。全栈自实现，仅依赖 libcurl。
 
 ## 特性
 
